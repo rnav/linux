@@ -86,6 +86,7 @@ static char tmpstr[128];
 
 static long bus_error_jmp[JMP_BUF_LEN];
 static int catch_memory_errors;
+static int doing_spr_access;
 static long *xmon_fault_jmp[NR_CPUS];
 
 /* Breakpoint stuff */
@@ -147,7 +148,7 @@ void getstring(char *, int);
 static void flush_input(void);
 static int inchar(void);
 static void take_input(char *);
-static unsigned long read_spr(int);
+static int  read_spr(int, unsigned long *);
 static void write_spr(int, unsigned long);
 static void super_regs(void);
 static void remove_bpts(void);
@@ -442,6 +443,8 @@ static int xmon_core(struct pt_regs *regs, int fromipi)
 #ifdef CONFIG_SMP
 	cpu = smp_processor_id();
 	if (cpumask_test_cpu(cpu, &cpus_in_xmon)) {
+		if (doing_spr_access)
+			longjmp(bus_error_jmp, 1);
 		get_output_lock();
 		excprint(regs);
 		printf("cpu 0x%x: Exception %lx %s in xmon, "
@@ -1635,76 +1638,42 @@ static void cacheflush(void)
 	catch_memory_errors = 0;
 }
 
-static unsigned long
-read_spr(int n)
+extern unsigned long do_mfspr(int spr, unsigned long default_value);
+extern unsigned long do_mtspr(int spr, unsigned long value);
+
+static int
+read_spr(int n, unsigned long *vp)
 {
-	unsigned int instrs[2];
-	unsigned long (*code)(void);
 	unsigned long ret = -1UL;
-#ifdef CONFIG_PPC64
-	unsigned long opd[3];
-
-	opd[0] = (unsigned long)instrs;
-	opd[1] = 0;
-	opd[2] = 0;
-	code = (unsigned long (*)(void)) opd;
-#else
-	code = (unsigned long (*)(void)) instrs;
-#endif
-
-	/* mfspr r3,n; blr */
-	instrs[0] = 0x7c6002a6 + ((n & 0x1F) << 16) + ((n & 0x3e0) << 6);
-	instrs[1] = 0x4e800020;
-	store_inst(instrs);
-	store_inst(instrs+1);
+	int ok = 0;
 
 	if (setjmp(bus_error_jmp) == 0) {
-		catch_memory_errors = 1;
+		doing_spr_access = 1;
 		sync();
 
-		ret = code();
+		ret = do_mfspr(n, *vp);
 
 		sync();
-		/* wait a little while to see if we get a machine check */
-		__delay(200);
-		n = size;
+		*vp = ret;
+		ok = 1;
 	}
+	doing_spr_access = 0;
 
-	return ret;
+	return ok;
 }
 
 static void
 write_spr(int n, unsigned long val)
 {
-	unsigned int instrs[2];
-	unsigned long (*code)(unsigned long);
-#ifdef CONFIG_PPC64
-	unsigned long opd[3];
-
-	opd[0] = (unsigned long)instrs;
-	opd[1] = 0;
-	opd[2] = 0;
-	code = (unsigned long (*)(unsigned long)) opd;
-#else
-	code = (unsigned long (*)(unsigned long)) instrs;
-#endif
-
-	instrs[0] = 0x7c6003a6 + ((n & 0x1F) << 16) + ((n & 0x3e0) << 6);
-	instrs[1] = 0x4e800020;
-	store_inst(instrs);
-	store_inst(instrs+1);
-
 	if (setjmp(bus_error_jmp) == 0) {
-		catch_memory_errors = 1;
+		doing_spr_access = 1;
 		sync();
 
-		code(val);
+		do_mtspr(n, val);
 
 		sync();
-		/* wait a little while to see if we get a machine check */
-		__delay(200);
-		n = size;
 	}
+	doing_spr_access = 0;
 }
 
 static unsigned long regno;
@@ -1714,6 +1683,7 @@ extern char dec_exc;
 static void super_regs(void)
 {
 	int cmd;
+	int spr;
 	unsigned long val;
 
 	cmd = skipbl();
@@ -1734,15 +1704,56 @@ static void super_regs(void)
 		return;
 	}
 
+	if (cmd == 'A') {
+		/* dump ALL SPRs */
+		for (spr = 1; spr < 1024; ++spr) {
+			if (spr >= 4 && spr <= 6)
+				continue;
+			val = 0xdeadbeef;
+			if (read_spr(spr, &val)) {
+				if (val == 0xdeadbeef) {
+					val = 0x0badcafe;
+					if (read_spr(spr, &val) &&
+					    val == 0x0badcafe) {
+						/* unimplemented, skip it */
+						continue;
+					}
+				}
+				printf("SPR 0x%3x (%4d) = %lx\n", spr, spr,
+				       val);
+			} else {
+				printf("SPR 0x%3x (%4d): ERROR\n", spr, spr);
+			}
+		}
+		return;
+	}
+
 	scanhex(&regno);
 	switch (cmd) {
 	case 'w':
-		val = read_spr(regno);
+		val = 0;
+		read_spr(regno, &val);
 		scanhex(&val);
 		write_spr(regno, val);
 		/* fall through */
 	case 'r':
-		printf("spr %lx = %lx\n", regno, read_spr(regno));
+		val = 0xdeadbeef;
+		if (!read_spr(regno, &val)) {
+			printf("Error reading SPR 0x%lx\n", regno);
+			break;
+		}
+		if (val == 0xdeadbeef) {
+			val = 0x0badcafe;
+			if (!read_spr(regno, &val)) {
+				printf("Error rereading SPR 0x%lx\n", regno);
+				break;
+			}
+			if (val == 0x0badcafe) {
+				printf("spr 0x%lx is not implemented\n", regno);
+				break;
+			}
+		}
+		printf("spr 0x%lx = %lx\n", regno, val);
 		break;
 	}
 	scannl();
