@@ -337,6 +337,8 @@ unsigned long ftrace_find_rec_direct(unsigned long ip);
 int register_ftrace_direct_multi(struct ftrace_ops *ops, unsigned long addr);
 int unregister_ftrace_direct_multi(struct ftrace_ops *ops, unsigned long addr);
 int modify_ftrace_direct_multi(struct ftrace_ops *ops, unsigned long addr);
+int arch_register_ftrace_direct(unsigned long ip, unsigned long addr);
+void arch_unregister_ftrace_direct(unsigned long ip, unsigned long addr);
 
 #else
 struct ftrace_ops;
