@@ -279,24 +279,17 @@ livepatch_handler:
 
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER
 _GLOBAL(ftrace_graph_caller)
-	stdu	r1, -112(r1)
+	stdu	r1,-SWITCH_FRAME_SIZE(r1)
 	/* with -mprofile-kernel, parameter regs are still alive at _mcount */
-	std	r10, 104(r1)
-	std	r9, 96(r1)
-	std	r8, 88(r1)
-	std	r7, 80(r1)
-	std	r6, 72(r1)
-	std	r5, 64(r1)
-	std	r4, 56(r1)
-	std	r3, 48(r1)
+	SAVE_8GPRS(3, r1)
 
 	/* Save callee's TOC in the ABI compliant location */
 	std	r2, 24(r1)
 	ld	r2, PACATOC(r13)	/* get kernel TOC in r2 */
 
-	addi	r5, r1, 112
+	addi	r5, r1, SWITCH_FRAME_SIZE
 	mfctr	r4		/* ftrace_caller has moved local addr here */
-	std	r4, 40(r1)
+	std	r4, _NIP(r1)
 	mflr	r3		/* ftrace_caller has restored LR from stack */
 	subi	r4, r4, MCOUNT_INSN_SIZE
 
@@ -309,21 +302,14 @@ _GLOBAL(ftrace_graph_caller)
 	 */
 	mtlr	r3
 
-	ld	r0, 40(r1)
+	ld	r0, _NIP(r1)
 	mtctr	r0
-	ld	r10, 104(r1)
-	ld	r9, 96(r1)
-	ld	r8, 88(r1)
-	ld	r7, 80(r1)
-	ld	r6, 72(r1)
-	ld	r5, 64(r1)
-	ld	r4, 56(r1)
-	ld	r3, 48(r1)
+	REST_8GPRS(3, r1)
 
 	/* Restore callee's TOC */
 	ld	r2, 24(r1)
 
-	addi	r1, r1, 112
+	addi	r1, r1, SWITCH_FRAME_SIZE
 	mflr	r0
 	std	r0, LRSAVE(r1)
 	bctr
