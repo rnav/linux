@@ -5232,6 +5232,13 @@ static struct ftrace_direct_func *ftrace_alloc_direct_func(unsigned long addr)
 
 static int register_ftrace_function_nolock(struct ftrace_ops *ops);
 
+int __weak arch_register_ftrace_direct(unsigned long ip, unsigned long addr)
+{
+	return 0;
+}
+
+void __weak arch_unregister_ftrace_direct(unsigned long ip, unsigned long addr) { }
+
 /**
  * register_ftrace_direct - Call a custom trampoline directly
  * @ip: The address of the nop at the beginning of a function
@@ -5256,6 +5263,7 @@ int register_ftrace_direct(unsigned long ip, unsigned long addr)
 	struct ftrace_hash *free_hash = NULL;
 	struct dyn_ftrace *rec;
 	int ret = -ENODEV;
+	int arch_ret;
 
 	mutex_lock(&direct_mutex);
 
@@ -5300,17 +5308,22 @@ int register_ftrace_direct(unsigned long ip, unsigned long addr)
 	if (!entry)
 		goto out_unlock;
 
-	ret = ftrace_set_filter_ip(&direct_ops, ip, 0, 0);
+	arch_ret = arch_register_ftrace_direct(ip, addr);
+	if (!arch_ret) {
+		ret = ftrace_set_filter_ip(&direct_ops, ip, 0, 0);
 
-	if (!ret && !(direct_ops.flags & FTRACE_OPS_FL_ENABLED)) {
-		ret = register_ftrace_function_nolock(&direct_ops);
-		if (ret)
-			ftrace_set_filter_ip(&direct_ops, ip, 1, 0);
+		if (!ret && !(direct_ops.flags & FTRACE_OPS_FL_ENABLED)) {
+			ret = register_ftrace_function_nolock(&direct_ops);
+			if (ret)
+				ftrace_set_filter_ip(&direct_ops, ip, 1, 0);
+		}
 	}
 
-	if (ret) {
+	if (arch_ret || ret) {
 		remove_hash_entry(direct_functions, entry);
 		kfree(entry);
+		if (!arch_ret)
+			arch_unregister_ftrace_direct(ip, addr);
 		if (!direct->count) {
 			list_del_rcu(&direct->next);
 			synchronize_rcu_tasks();
@@ -5388,6 +5401,7 @@ int unregister_ftrace_direct(unsigned long ip, unsigned long addr)
 	WARN_ON(ret);
 
 	remove_hash_entry(direct_functions, entry);
+	arch_unregister_ftrace_direct(ip, addr); /* TODO */
 
 	direct = ftrace_find_direct_func(addr);
 	if (!WARN_ON(!direct)) {
