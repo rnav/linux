@@ -310,7 +310,5 @@ _GLOBAL(ftrace_graph_caller)
 	ld	r2, 24(r1)
 
 	addi	r1, r1, SWITCH_FRAME_SIZE
-	mflr	r0
-	std	r0, LRSAVE(r1)
 	bctr
 #endif /* CONFIG_FUNCTION_GRAPH_TRACER */
