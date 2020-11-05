@@ -37,6 +37,7 @@ static DEFINE_HASHTABLE(ppc_ftrace_stubs, 8);
 struct ppc_ftrace_stub_data {
 	unsigned long addr;
 	unsigned long target;
+	refcount_t refs;
 	struct hlist_node hentry;
 };
 
@@ -299,7 +300,7 @@ static unsigned long find_ftrace_tramp(unsigned long ip, unsigned long target)
 	return 0;
 }
 
-static int add_ftrace_tramp(unsigned long tramp, unsigned long target)
+static int add_ftrace_tramp(unsigned long tramp, unsigned long target, int lock)
 {
 	struct ppc_ftrace_stub_data *stub;
 
@@ -309,10 +310,122 @@ static int add_ftrace_tramp(unsigned long tramp, unsigned long target)
 
 	stub->addr = tramp;
 	stub->target = target;
+	refcount_set(&stub->refs, 1);
+	if (lock)
+		refcount_inc(&stub->refs);
 	hash_add(ppc_ftrace_stubs, &stub->hentry, target);
 
 	return 0;
 }
+
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
+static u32 ftrace_direct_stub_insns[] = {
+	PPC_RAW_LIS(12, 0),
+	PPC_RAW_ORI(12, 12, 0),
+	PPC_RAW_SLDI(12, 12, 32),
+	PPC_RAW_ORIS(12, 12, 0),
+	PPC_RAW_ORI(12, 12, 0),
+	PPC_RAW_MTCTR(12),
+	PPC_RAW_BCTR(),
+};
+#define FTRACE_NUM_STUBS	(FTRACE_STUBS_SIZE / sizeof(ftrace_direct_stub_insns))
+static DECLARE_BITMAP(stubs_bitmap, FTRACE_NUM_STUBS);
+extern unsigned int ftrace_stubs[];
+
+static unsigned long get_ftrace_tramp(unsigned long ip, unsigned long target)
+{
+	struct ppc_ftrace_stub_data *stub_data;
+	struct ppc_inst instr;
+	unsigned int *stub;
+	int index;
+
+	hash_for_each_possible(ppc_ftrace_stubs, stub_data, hentry, target) {
+		if (stub_data->target == target &&
+				!create_branch(&instr, (void *)ip, stub_data->addr, 0)) {
+			refcount_inc(&stub_data->refs);
+			return stub_data->addr;
+		}
+	}
+
+	/* Allocate a stub */
+	do {
+		index = find_first_zero_bit(stubs_bitmap, FTRACE_NUM_STUBS);
+		if (index >= FTRACE_NUM_STUBS) {
+			pr_err("No stubs available\n");
+			return 0;
+		}
+	} while (test_and_set_bit(index, stubs_bitmap));
+	stub = &ftrace_stubs[index * sizeof(ftrace_direct_stub_insns) / 4];
+
+	if (create_branch(&instr, (void *)ip, (unsigned long)stub, 0)) {
+		/* Stub is not reachable from the ftrace location */
+		clear_bit(index, stubs_bitmap);
+		return 0;
+	}
+
+	memcpy(stub, ftrace_direct_stub_insns, sizeof(ftrace_direct_stub_insns));
+	stub[0] |= IMM_L(target >> 48);
+	stub[1] |= IMM_L(target >> 32);
+	stub[3] |= IMM_L(target >> 16);
+	stub[4] |= IMM_L(target);
+	if (add_ftrace_tramp((unsigned long)stub, target, 0)) {
+		pr_err("Error allocating ftrace stub");
+		clear_bit(index, stubs_bitmap);
+		return 0;
+	}
+
+	return (unsigned long)stub;
+}
+
+static void remove_ftrace_tramp(unsigned long ip, unsigned long target, unsigned long stub_addr)
+{
+	struct ppc_ftrace_stub_data *stub;
+	unsigned long tramp = 0;
+	struct ppc_inst instr;
+	int index;
+
+	hash_for_each_possible(ppc_ftrace_stubs, stub, hentry, target) {
+		if (stub->target == target && stub->addr == stub_addr &&
+				!create_branch(&instr, (void *)ip, stub->addr, 0)) {
+			if (refcount_dec_and_test(&stub->refs)) {
+				tramp = stub->addr;
+				hash_del(&stub->hentry);
+				kfree(stub);
+				break;
+			}
+			return;
+		}
+	}
+
+	if (tramp) {
+		synchronize_rcu_tasks();
+		index = (tramp - (unsigned long)ftrace_stubs) / sizeof(ftrace_direct_stub_insns);
+		clear_bit(index, stubs_bitmap);
+	}
+}
+
+int arch_register_ftrace_direct(unsigned long ip, unsigned long addr)
+{
+	if (addr & 0x03) {
+		pr_err("Target address is not at instruction boundary: 0x%lx\n", addr);
+		return -EINVAL;
+	}
+
+	if (is_module_text_address(ip)) {
+		pr_err("Kernel modules are not supported for direct calls\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+#else
+static unsigned long get_ftrace_tramp(unsigned long ip, unsigned long target)
+{
+	return find_ftrace_tramp(ip, target);
+}
+
+static void remove_ftrace_tramp(unsigned long ip, unsigned long target, unsigned long stub_addr) { }
+#endif
 
 /*
  * If this is a compiler generated long_branch trampoline (essentially, a
@@ -365,7 +478,7 @@ static int setup_mcount_compiler_tramp(unsigned long tramp)
 		return -1;
 	}
 
-	if (add_ftrace_tramp(tramp, ftrace_target)) {
+	if (add_ftrace_tramp(tramp, ftrace_target, 1)) {
 		pr_debug("No tramp locations left\n");
 		return -1;
 	}
@@ -408,6 +521,8 @@ static int __ftrace_make_nop_kernel(struct dyn_ftrace *rec, unsigned long addr)
 		pr_err("Patching NOP failed.\n");
 		return -EPERM;
 	}
+
+	remove_ftrace_tramp(ip, addr, tramp);
 
 	return 0;
 }
@@ -631,7 +746,7 @@ static int __ftrace_make_call_kernel(struct dyn_ftrace *rec, unsigned long addr)
 		return -EINVAL;
 	}
 
-	tramp = find_ftrace_tramp((unsigned long)ip, ptr);
+	tramp = get_ftrace_tramp((unsigned long)ip, ptr);
 	if (!tramp) {
 		pr_err("No ftrace trampolines reachable from %ps\n", ip);
 		return -EINVAL;
@@ -782,7 +897,7 @@ __ftrace_modify_call_kernel(struct dyn_ftrace *rec, unsigned long old_addr, unsi
 {
 	struct ppc_inst op;
 	unsigned long ip = rec->ip;
-	unsigned long entry, ptr, tramp;
+	unsigned long entry, ptr, tramp, tramp_old = 0;
 
 	/* read where this goes */
 	if (probe_kernel_read_inst(&op, (void *)ip)) {
@@ -814,6 +929,8 @@ __ftrace_modify_call_kernel(struct dyn_ftrace *rec, unsigned long old_addr, unsi
 			pr_err("we don't know about the tramp at %lx!\n", tramp);
 			return -EFAULT;
 		}
+
+		tramp_old = tramp;
 	}
 
 	/* The new target may be within range */
@@ -824,7 +941,7 @@ __ftrace_modify_call_kernel(struct dyn_ftrace *rec, unsigned long old_addr, unsi
 			return -EINVAL;
 		}
 
-		return 0;
+		goto out;
 	}
 
 	ptr = ppc_global_function_entry((void *)addr);
@@ -836,7 +953,7 @@ __ftrace_modify_call_kernel(struct dyn_ftrace *rec, unsigned long old_addr, unsi
 		ptr = ppc_global_function_entry((void *)FTRACE_REGS_ADDR);
 #endif
 
-	tramp = find_ftrace_tramp(ip, ptr);
+	tramp = get_ftrace_tramp(ip, ptr);
 
 	if (!tramp) {
 		pr_err("Couldn't find a trampoline\n");
@@ -850,8 +967,13 @@ __ftrace_modify_call_kernel(struct dyn_ftrace *rec, unsigned long old_addr, unsi
 		return -EINVAL;
 	}
 
+out:
+	if (tramp_old)
+		remove_ftrace_tramp(ip, old_addr, tramp_old);
+
 	return 0;
 }
+
 int ftrace_modify_call(struct dyn_ftrace *rec, unsigned long old_addr,
 			unsigned long addr)
 {
@@ -950,8 +1072,12 @@ int __init ftrace_dyn_arch_init(void)
 		memcpy(tramp[i], stub_insns, sizeof(stub_insns));
 		tramp[i][1] |= PPC_HA(reladdr);
 		tramp[i][2] |= PPC_LO(reladdr);
-		add_ftrace_tramp((unsigned long)tramp[i], addr);
+		add_ftrace_tramp((unsigned long)tramp[i], addr, 1);
 	}
+
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
+	bitmap_zero(stubs_bitmap, FTRACE_NUM_STUBS);
+#endif
 
 	return 0;
 }

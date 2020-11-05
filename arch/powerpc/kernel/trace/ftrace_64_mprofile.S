@@ -13,6 +13,13 @@
 #include <asm/bug.h>
 #include <asm/ptrace.h>
 
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
+	.balign	4
+.global ftrace_stubs
+ftrace_stubs:
+	.space FTRACE_STUBS_SIZE
+#endif
+
 /*
  *
  * ftrace_caller()/ftrace_regs_caller() is the function that replaces _mcount()
@@ -91,6 +98,10 @@ _GLOBAL(ftrace_regs_caller)
 	std     r10, _XER(r1)
 	std     r11, _CCR(r1)
 
+	/* Clear out orig_gpr3 */
+	li	r6, 0
+	std	r6, ORIG_GPR3(r1)
+
 	/* Load &pt_regs in r6 for call below */
 	addi    r6, r1 ,STACK_FRAME_OVERHEAD
 
@@ -103,19 +114,33 @@ ftrace_regs_call:
 	/* Load ctr with the possibly modified NIP */
 	ld	r3, _NIP(r1)
 	mtctr	r3
+
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
+	/* Check if we should go to a direct call next */
+	ld	r4, ORIG_GPR3(r1)
+	cmpdi	r4, 0
+	beq+	1f
+	/* r4 has the direct call target, setup LR and r0 as on our entry, reset cr0 */
+	mtctr	r4
+	mtlr	r3
+	ld	r0, _LINK(r1)
+	cmpd	r3, r3
+	b	2f
+#endif
+
+1:
 #ifdef CONFIG_LIVEPATCH
 	cmpd	r14, r3		/* has NIP been altered? */
 #endif
 
-	/* Restore gprs */
-	REST_GPR(0,r1)
-	REST_10GPRS(2,r1)
-	REST_10GPRS(12,r1)
-	REST_10GPRS(22,r1)
-
 	/* Restore possibly modified LR */
 	ld	r0, _LINK(r1)
 	mtlr	r0
+
+	/* Restore gprs */
+2:	REST_10GPRS(2,r1)
+	REST_10GPRS(12,r1)
+	REST_10GPRS(22,r1)
 
 	/* Restore callee's TOC */
 	ld	r2, 24(r1)
@@ -282,6 +307,7 @@ _GLOBAL(ftrace_graph_caller)
 	stdu	r1,-SWITCH_FRAME_SIZE(r1)
 	/* with -mprofile-kernel, parameter regs are still alive at _mcount */
 	SAVE_8GPRS(3, r1)
+	SAVE_GPR(0, r1)
 
 	/* Save callee's TOC in the ABI compliant location */
 	std	r2, 24(r1)
@@ -304,6 +330,8 @@ _GLOBAL(ftrace_graph_caller)
 
 	ld	r0, _NIP(r1)
 	mtctr	r0
+
+	REST_GPR(0, r1)
 	REST_8GPRS(3, r1)
 
 	/* Restore callee's TOC */

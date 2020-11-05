@@ -10,6 +10,8 @@
 
 #define HAVE_FUNCTION_GRAPH_RET_ADDR_PTR
 
+#define FTRACE_STUBS_SIZE	65536
+
 #ifdef __ASSEMBLY__
 
 /* Based off of objdump optput from glibc */
@@ -59,6 +61,18 @@ static inline unsigned long ftrace_call_adjust(unsigned long addr)
 struct dyn_arch_ftrace {
 	struct module *mod;
 };
+
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
+/*
+ * When there is a direct caller registered, we use regs->orig_gpr3 (similar to
+ * how x86 uses orig_ax) to let ftrace_{regs_}_caller know that we should go
+ * there instead of returning to the function
+ */
+static inline void arch_ftrace_set_direct_caller(struct pt_regs *regs, unsigned long addr)
+{
+	regs->orig_gpr3 = addr;
+}
+#endif /* CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS */
 #endif /* __ASSEMBLY__ */
 
 #ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
