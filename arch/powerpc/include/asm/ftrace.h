@@ -9,6 +9,7 @@
 #define MCOUNT_INSN_SIZE	4 /* sizeof mcount call */
 
 #define HAVE_FUNCTION_GRAPH_RET_ADDR_PTR
+#define FTRACE_STUBS_SIZE	65536
 
 #ifndef __ASSEMBLY__
 extern void _mcount(void);
@@ -49,6 +50,18 @@ struct ftrace_ops;
 void ftrace_graph_func(unsigned long ip, unsigned long parent_ip,
 		       struct ftrace_ops *op, struct ftrace_regs *fregs);
 #endif
+
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
+/*
+ * When there is a direct caller registered, we use regs->orig_gpr3 (similar to
+ * how x86 uses orig_ax) to let ftrace_{regs_}_caller know that we should go
+ * there instead of returning to the function
+ */
+static inline void arch_ftrace_set_direct_caller(struct pt_regs *regs, unsigned long addr)
+{
+	regs->orig_gpr3 = addr;
+}
+#endif /* CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS */
 #endif /* __ASSEMBLY__ */
 
 #ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS

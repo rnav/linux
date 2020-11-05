@@ -13,6 +13,13 @@
 #include <asm/bug.h>
 #include <asm/ptrace.h>
 
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
+	.balign	32
+.global ftrace_stubs
+ftrace_stubs:
+	.space FTRACE_STUBS_SIZE
+#endif
+
 /*
  *
  * ftrace_caller()/ftrace_regs_caller() is the function that replaces _mcount()
@@ -109,6 +116,10 @@
 	PPC_STL	r9, _CTR(r1)
 	PPC_STL	r10, _XER(r1)
 	PPC_STL	r11, _CCR(r1)
+
+	/* Clear out orig_gpr3 */
+	li	r6, 0
+	PPC_STL	r6, ORIG_GPR3(r1)
 	.endif
 
 	/* Load &pt_regs in r6 for call below */
@@ -120,10 +131,30 @@
 	PPC_LL	r3, _NIP(r1)
 	mtctr	r3
 
+	/* Restore possibly modified LR */
+	PPC_LL	r0, _LINK(r1)
+	mtlr	r0
+
+	.if \allregs == 1
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
+	/* Check if we should go to a direct call next */
+	PPC_LL	r4, ORIG_GPR3(r1)
+	PPC_LCMPI r4, 0
+	beq+	1f
+	/* r4 has the direct call target, setup LR and r0 as on our entry, reset cr0 */
+	mtctr	r4
+	mtlr	r3
+	PPC_LCMP r3, r3
+	b	2f
+1:
+#endif
+	.endif
+
 #ifdef CONFIG_LIVEPATCH_64
 	cmpd	r14, r3		/* has NIP been altered? */
 #endif
 
+2:
 	/* Restore gprs */
 	.if \allregs == 1
 	REST_GPRS(2, 31, r1)
@@ -133,10 +164,6 @@
 	REST_GPR(14, r1)
 #endif
 	.endif
-
-	/* Restore possibly modified LR */
-	PPC_LL	r0, _LINK(r1)
-	mtlr	r0
 
 #ifdef CONFIG_PPC64
 	/* Restore callee's TOC */
