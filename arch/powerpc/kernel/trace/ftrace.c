@@ -302,7 +302,6 @@ static int setup_mcount_compiler_tramp(unsigned long tramp)
 	ppc_inst_t op;
 	unsigned long ptr;
 	ppc_inst_t instr;
-	static unsigned long ftrace_plt_tramps[NUM_FTRACE_TRAMPS];
 
 	/* Is this a known long jump tramp? */
 	for (i = 0; i < NUM_FTRACE_TRAMPS; i++)
@@ -310,13 +309,6 @@ static int setup_mcount_compiler_tramp(unsigned long tramp)
 			break;
 		else if (ftrace_tramps[i] == tramp)
 			return 0;
-
-	/* Is this a known plt tramp? */
-	for (i = 0; i < NUM_FTRACE_TRAMPS; i++)
-		if (!ftrace_plt_tramps[i])
-			break;
-		else if (ftrace_plt_tramps[i] == tramp)
-			return -1;
 
 	/* New trampoline -- read where this goes */
 	if (copy_inst_from_kernel_nofault(&op, (void *)tramp)) {
