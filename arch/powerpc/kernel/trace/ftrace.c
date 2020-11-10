@@ -282,10 +282,7 @@ static int setup_mcount_compiler_tramp(unsigned long tramp)
 	}
 
 	/* Let's re-write the tramp to go to ftrace_[regs_]caller */
-	if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE_WITH_REGS))
-		ptr = ppc_global_function_entry((void *)ftrace_regs_caller);
-	else
-		ptr = ppc_global_function_entry((void *)ftrace_caller);
+	ptr = ppc_global_function_entry((void *)FTRACE_REGS_ADDR);
 
 	if (patch_branch((u32 *)tramp, ptr, 0)) {
 		pr_debug("REL24 out of range!\n");
@@ -732,15 +729,8 @@ int __init ftrace_dyn_arch_init(void)
 		PPC_RAW_MTCTR(_R12),
 		PPC_RAW_BCTR()
 	};
-	unsigned long addr;
-	long reladdr;
-
-	if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE_WITH_REGS))
-		addr = ppc_global_function_entry((void *)ftrace_regs_caller);
-	else
-		addr = ppc_global_function_entry((void *)ftrace_caller);
-
-	reladdr = addr - kernel_toc_addr();
+	unsigned long addr = ppc_global_function_entry((void *)FTRACE_REGS_ADDR);
+	long reladdr = addr - kernel_toc_addr();
 
 	if (reladdr >= SZ_2G || reladdr < -(long)SZ_2G) {
 		pr_err("Address of %ps out of range of kernel_toc.\n",
