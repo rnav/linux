@@ -331,11 +331,7 @@ static int setup_mcount_compiler_tramp(unsigned long tramp)
 	}
 
 	/* Let's re-write the tramp to go to ftrace_[regs_]caller */
-#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
-	ptr = ppc_global_function_entry((void *)ftrace_regs_caller);
-#else
-	ptr = ppc_global_function_entry((void *)ftrace_caller);
-#endif
+	ptr = ppc_global_function_entry((void *)FTRACE_REGS_ADDR);
 	if (create_branch(&instr, (void *)tramp, ptr, 0)) {
 		pr_debug("%ps is not reachable from existing mcount tramp\n",
 				(void *)ptr);
@@ -866,11 +862,7 @@ int __init ftrace_dyn_arch_init(void)
 		0x7d8903a6,		/* mtctr   r12			*/
 		0x4e800420,		/* bctr				*/
 	};
-#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
-	unsigned long addr = ppc_global_function_entry((void *)ftrace_regs_caller);
-#else
-	unsigned long addr = ppc_global_function_entry((void *)ftrace_caller);
-#endif
+	unsigned long addr = ppc_global_function_entry((void *)FTRACE_REGS_ADDR);
 	long reladdr = addr - kernel_toc_addr();
 
 	if (reladdr > 0x7FFFFFFF || reladdr < -(0x80000000L)) {
