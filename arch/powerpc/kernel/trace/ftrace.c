@@ -13,6 +13,7 @@
 
 #define pr_fmt(fmt) "ftrace-powerpc: " fmt
 
+#include <linux/hashtable.h>
 #include <linux/spinlock.h>
 #include <linux/hardirq.h>
 #include <linux/uaccess.h>
@@ -32,14 +33,12 @@
 
 #ifdef CONFIG_DYNAMIC_FTRACE
 
-/*
- * We generally only have a single long_branch tramp and at most 2 or 3 plt
- * tramps generated. But, we don't use the plt tramps currently. We also allot
- * 2 tramps after .text and .init.text. So, we only end up with around 3 usable
- * tramps in total. Set aside 8 just to be sure.
- */
-#define	NUM_FTRACE_TRAMPS	8
-static unsigned long ftrace_tramps[NUM_FTRACE_TRAMPS];
+static DEFINE_HASHTABLE(ppc_ftrace_stubs, 8);
+struct ppc_ftrace_stub_data {
+	unsigned long addr;
+	unsigned long target;
+	struct hlist_node hentry;
+};
 
 static struct ppc_inst
 ftrace_call_replace(unsigned long ip, unsigned long addr, int link)
@@ -288,36 +287,31 @@ __ftrace_make_nop(struct module *mod,
 #endif /* PPC64 */
 #endif /* CONFIG_MODULES */
 
-static unsigned long find_ftrace_tramp(unsigned long ip)
+static unsigned long find_ftrace_tramp(unsigned long ip, unsigned long target)
 {
-	int i;
+	struct ppc_ftrace_stub_data *stub;
 	struct ppc_inst instr;
 
-	/*
-	 * We have the compiler generated long_branch tramps at the end
-	 * and we prefer those
-	 */
-	for (i = NUM_FTRACE_TRAMPS - 1; i >= 0; i--)
-		if (!ftrace_tramps[i])
-			continue;
-		else if (create_branch(&instr, (void *)ip,
-				       ftrace_tramps[i], 0) == 0)
-			return ftrace_tramps[i];
+	hash_for_each_possible(ppc_ftrace_stubs, stub, hentry, target)
+		if (stub->target == target && !create_branch(&instr, (void *)ip, stub->addr, 0))
+			return stub->addr;
 
 	return 0;
 }
 
-static int add_ftrace_tramp(unsigned long tramp)
+static int add_ftrace_tramp(unsigned long tramp, unsigned long target)
 {
-	int i;
+	struct ppc_ftrace_stub_data *stub;
 
-	for (i = 0; i < NUM_FTRACE_TRAMPS; i++)
-		if (!ftrace_tramps[i]) {
-			ftrace_tramps[i] = tramp;
-			return 0;
-		}
+	stub = kmalloc(sizeof(*stub), GFP_KERNEL);
+	if (!stub)
+		return -1;
 
-	return -1;
+	stub->addr = tramp;
+	stub->target = target;
+	hash_add(ppc_ftrace_stubs, &stub->hentry, target);
+
+	return 0;
 }
 
 /*
@@ -328,16 +322,14 @@ static int add_ftrace_tramp(unsigned long tramp)
  */
 static int setup_mcount_compiler_tramp(unsigned long tramp)
 {
-	int i;
 	struct ppc_inst op;
-	unsigned long ptr;
 	struct ppc_inst instr;
+	struct ppc_ftrace_stub_data *stub;
+	unsigned long ptr, ftrace_target = ppc_global_function_entry((void *)FTRACE_REGS_ADDR);
 
 	/* Is this a known long jump tramp? */
-	for (i = 0; i < NUM_FTRACE_TRAMPS; i++)
-		if (!ftrace_tramps[i])
-			break;
-		else if (ftrace_tramps[i] == tramp)
+	hash_for_each_possible(ppc_ftrace_stubs, stub, hentry, ftrace_target)
+		if (stub->target == ftrace_target && stub->addr == tramp)
 			return 0;
 
 	/* New trampoline -- read where this goes */
@@ -361,19 +353,18 @@ static int setup_mcount_compiler_tramp(unsigned long tramp)
 	}
 
 	/* Let's re-write the tramp to go to ftrace_[regs_]caller */
-	ptr = ppc_global_function_entry((void *)FTRACE_REGS_ADDR);
-	if (create_branch(&instr, (void *)tramp, ptr, 0)) {
+	if (create_branch(&instr, (void *)tramp, ftrace_target, 0)) {
 		pr_debug("%ps is not reachable from existing mcount tramp\n",
-				(void *)ptr);
+				(void *)ftrace_target);
 		return -1;
 	}
 
-	if (patch_branch((struct ppc_inst *)tramp, ptr, 0)) {
+	if (patch_branch((struct ppc_inst *)tramp, ftrace_target, 0)) {
 		pr_debug("REL24 out of range!\n");
 		return -1;
 	}
 
-	if (add_ftrace_tramp(tramp)) {
+	if (add_ftrace_tramp(tramp, ftrace_target)) {
 		pr_debug("No tramp locations left\n");
 		return -1;
 	}
@@ -405,7 +396,7 @@ static int __ftrace_make_nop_kernel(struct dyn_ftrace *rec, unsigned long addr)
 
 	if (setup_mcount_compiler_tramp(tramp)) {
 		/* Are other trampolines reachable? */
-		if (!find_ftrace_tramp(ip)) {
+		if (!find_ftrace_tramp(ip, FTRACE_REGS_ADDR)) {
 			pr_err("No ftrace trampolines reachable from %ps\n",
 					(void *)ip);
 			return -EINVAL;
@@ -646,7 +637,7 @@ static int __ftrace_make_call_kernel(struct dyn_ftrace *rec, unsigned long addr)
 		return -EINVAL;
 	}
 
-	tramp = find_ftrace_tramp((unsigned long)ip);
+	tramp = find_ftrace_tramp((unsigned long)ip, FTRACE_REGS_ADDR);
 	if (!tramp) {
 		pr_err("No ftrace trampolines reachable from %ps\n", ip);
 		return -EINVAL;
@@ -894,7 +885,7 @@ int __init ftrace_dyn_arch_init(void)
 		memcpy(tramp[i], stub_insns, sizeof(stub_insns));
 		tramp[i][1] |= PPC_HA(reladdr);
 		tramp[i][2] |= PPC_LO(reladdr);
-		add_ftrace_tramp((unsigned long)tramp[i]);
+		add_ftrace_tramp((unsigned long)tramp[i], addr);
 	}
 
 	return 0;
