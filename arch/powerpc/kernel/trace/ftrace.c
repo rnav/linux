@@ -322,14 +322,15 @@ static int add_ftrace_tramp(unsigned long tramp, unsigned long target)
  */
 static int setup_mcount_compiler_tramp(unsigned long tramp)
 {
+	int i;
 	struct ppc_inst op;
 	struct ppc_inst instr;
 	struct ppc_ftrace_stub_data *stub;
 	unsigned long ptr, ftrace_target = ppc_global_function_entry((void *)FTRACE_REGS_ADDR);
 
-	/* Is this a known long jump tramp? */
-	hash_for_each_possible(ppc_ftrace_stubs, stub, hentry, ftrace_target)
-		if (stub->target == ftrace_target && stub->addr == tramp)
+	/* Is this a known tramp? */
+	hash_for_each(ppc_ftrace_stubs, i, stub, hentry)
+		if (stub->addr == tramp)
 			return 0;
 
 	/* New trampoline -- read where this goes */
@@ -608,23 +609,16 @@ static int __ftrace_make_call_kernel(struct dyn_ftrace *rec, unsigned long addr)
 {
 	struct ppc_inst op;
 	void *ip = (void *)rec->ip;
-	unsigned long tramp, entry, ptr;
+	unsigned long tramp, ptr;
 
-	/* Make sure we're being asked to patch branch to a known ftrace addr */
-	entry = ppc_global_function_entry((void *)ftrace_caller);
 	ptr = ppc_global_function_entry((void *)addr);
 
-	if (ptr != entry) {
 #ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
-		entry = ppc_global_function_entry((void *)ftrace_regs_caller);
-		if (ptr != entry) {
+	/* Make sure we branch to ftrace_regs_caller since we only setup stubs for that */
+	tramp = ppc_global_function_entry((void *)ftrace_caller);
+	if (ptr == tramp)
+		ptr = ppc_global_function_entry((void *)FTRACE_REGS_ADDR);
 #endif
-			pr_err("Unknown ftrace addr to patch: %ps\n", (void *)ptr);
-			return -EINVAL;
-#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
-		}
-#endif
-	}
 
 	/* Make sure we have a nop */
 	if (probe_kernel_read_inst(&op, ip)) {
@@ -637,7 +631,7 @@ static int __ftrace_make_call_kernel(struct dyn_ftrace *rec, unsigned long addr)
 		return -EINVAL;
 	}
 
-	tramp = find_ftrace_tramp((unsigned long)ip, FTRACE_REGS_ADDR);
+	tramp = find_ftrace_tramp((unsigned long)ip, ptr);
 	if (!tramp) {
 		pr_err("No ftrace trampolines reachable from %ps\n", ip);
 		return -EINVAL;
@@ -783,6 +777,81 @@ __ftrace_modify_call(struct dyn_ftrace *rec, unsigned long old_addr,
 }
 #endif
 
+static int
+__ftrace_modify_call_kernel(struct dyn_ftrace *rec, unsigned long old_addr, unsigned long addr)
+{
+	struct ppc_inst op;
+	unsigned long ip = rec->ip;
+	unsigned long entry, ptr, tramp;
+
+	/* read where this goes */
+	if (probe_kernel_read_inst(&op, (void *)ip)) {
+		pr_err("Fetching opcode failed.\n");
+		return -EFAULT;
+	}
+
+	/* Make sure that this is still a 24bit jump */
+	if (!is_bl_op(op)) {
+		pr_err("Not expected bl: opcode is %s\n", ppc_inst_as_str(op));
+		return -EINVAL;
+	}
+
+	/* lets find where the pointer goes */
+	tramp = find_bl_target(ip, op);
+	entry = ppc_global_function_entry((void *)old_addr);
+
+	pr_devel("ip:%lx jumps to %lx", ip, tramp);
+
+	if (tramp != entry) {
+		/* old_addr is not within range, so we must have used a trampoline */
+		struct ppc_ftrace_stub_data *stub;
+
+		hash_for_each_possible(ppc_ftrace_stubs, stub, hentry, entry)
+			if (stub->target == entry && stub->addr == tramp)
+				break;
+
+		if (stub->target != entry || stub->addr != tramp) {
+			pr_err("we don't know about the tramp at %lx!\n", tramp);
+			return -EFAULT;
+		}
+	}
+
+	/* The new target may be within range */
+	if (test_24bit_addr(ip, addr)) {
+		/* within range */
+		if (patch_branch((struct ppc_inst *)ip, addr, BRANCH_SET_LINK)) {
+			pr_err("REL24 out of range!\n");
+			return -EINVAL;
+		}
+
+		return 0;
+	}
+
+	ptr = ppc_global_function_entry((void *)addr);
+
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
+	/* Make sure we branch to ftrace_regs_caller since we only setup stubs for that */
+	entry = ppc_global_function_entry((void *)ftrace_caller);
+	if (ptr == entry)
+		ptr = ppc_global_function_entry((void *)FTRACE_REGS_ADDR);
+#endif
+
+	tramp = find_ftrace_tramp(ip, ptr);
+
+	if (!tramp) {
+		pr_err("Couldn't find a trampoline\n");
+		return -EFAULT;
+	}
+
+	pr_devel("trampoline %lx target %lx", tramp, ptr);
+
+	if (patch_branch((struct ppc_inst *)ip, tramp, BRANCH_SET_LINK)) {
+		pr_err("REL24 out of range!\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
 int ftrace_modify_call(struct dyn_ftrace *rec, unsigned long old_addr,
 			unsigned long addr)
 {
@@ -800,11 +869,7 @@ int ftrace_modify_call(struct dyn_ftrace *rec, unsigned long old_addr,
 		new = ftrace_call_replace(ip, addr, 1);
 		return ftrace_modify_code(ip, old, new);
 	} else if (core_kernel_text(ip)) {
-		/*
-		 * We always patch out of range locations to go to the regs
-		 * variant, so there is nothing to do here
-		 */
-		return 0;
+		return __ftrace_modify_call_kernel(rec, old_addr, addr);
 	}
 
 #ifdef CONFIG_MODULES
