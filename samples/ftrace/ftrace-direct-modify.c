@@ -3,6 +3,7 @@
 #include <linux/kthread.h>
 #include <linux/ftrace.h>
 #include <asm/asm-offsets.h>
+#include <linux/kprobes.h>
 
 extern void my_direct_func1(void);
 extern void my_direct_func2(void);
@@ -53,6 +54,60 @@ asm (
 );
 
 #endif /* CONFIG_X86_64 */
+
+#ifdef CONFIG_PPC64
+
+asm (
+"	.pushsection	.text, \"ax\", @progbits\n"
+"	.type		my_tramp1, @function\n"
+"	.global		my_tramp1\n"
+"   my_tramp1:\n"
+"	std	0, 16(1)\n"
+"	stdu	1, -480(1)\n"
+"	std	2, 24(1)\n"
+"	mflr	7\n"
+"	std	7, 368(1)\n"
+"	bcl	20, 31, 1f\n"
+"1:	mflr	12\n"
+"	ld	2, (3f - 1b)(12)\n"
+"	bl	my_direct_func1\n"
+"	nop\n"
+"	ld	2, 24(1)\n"
+"	ld	7, 368(1)\n"
+"	mtctr	7\n"
+"	addi	1, 1, 480\n"
+"	ld	0, 16(1)\n"
+"	mtlr	0\n"
+"	bctr\n"
+"	.size		my_tramp1, .-my_tramp1\n"
+"	nop\n"
+"	.type		my_tramp2, @function\n"
+"	.global		my_tramp2\n"
+"   my_tramp2:\n"
+"	std	0, 16(1)\n"
+"	stdu	1, -480(1)\n"
+"	std	2, 24(1)\n"
+"	mflr	7\n"
+"	std	7, 368(1)\n"
+"	bcl	20, 31, 2f\n"
+"2:	mflr	12\n"
+"	ld	2, (3f - 2b)(12)\n"
+"	bl	my_direct_func2\n"
+"	nop\n"
+"	ld	2, 24(1)\n"
+"	ld	7, 368(1)\n"
+"	mtctr	7\n"
+"	addi	1, 1, 480\n"
+"	ld	0, 16(1)\n"
+"	mtlr	0\n"
+"	bctr\n"
+"	.size		my_tramp2, .-my_tramp2\n"
+"3:\n"
+"	.quad		.TOC.@tocbase\n"
+"	.popsection\n"
+);
+
+#endif /* CONFIG_PPC64 */
 
 #ifdef CONFIG_S390
 
@@ -125,6 +180,10 @@ static struct task_struct *simple_tsk;
 static int __init ftrace_direct_init(void)
 {
 	int ret;
+
+#ifdef CONFIG_PPC64
+	my_ip = ppc_function_entry((void *)my_ip) + 4;
+#endif
 
 	ret = register_ftrace_direct(my_ip, my_tramp);
 	if (!ret)
