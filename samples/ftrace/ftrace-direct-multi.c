@@ -64,6 +64,40 @@ asm (
 
 #endif /* CONFIG_S390 */
 
+#ifdef CONFIG_PPC64
+
+asm (
+"	.pushsection	.text, \"ax\", @progbits\n"
+"	.type		my_tramp, @function\n"
+"	.global		my_tramp\n"
+"   my_tramp:\n"
+"	std	0, 16(1)\n"
+"	stdu	1, -480(1)\n"
+"	std	2, 24(1)\n"
+"	std	3, 136(1)\n"
+"	mflr	7\n"
+"	std	7, 368(1)\n"
+"	bcl	20, 31, 1f\n"
+"1:	mflr	12\n"
+"	ld	2, (2f - 1b)(12)\n"
+"	bl	my_direct_func\n"
+"	nop\n"
+"	ld	3, 136(1)\n"
+"	ld	2, 24(1)\n"
+"	ld	7, 368(1)\n"
+"	mtctr	7\n"
+"	addi	1, 1, 480\n"
+"	ld	0, 16(1)\n"
+"	mtlr	0\n"
+"	bctr\n"
+"	.size		my_tramp, .-my_tramp\n"
+"2:\n"
+"	.quad		.TOC.@tocbase\n"
+"	.popsection\n"
+);
+
+#endif /* CONFIG_PPC64 */
+
 static struct ftrace_ops direct;
 
 static int __init ftrace_direct_multi_init(void)
