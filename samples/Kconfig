@@ -26,7 +26,7 @@ config SAMPLE_TRACE_PRINTK
 config SAMPLE_FTRACE_DIRECT
 	tristate "Build register_ftrace_direct() example"
 	depends on DYNAMIC_FTRACE_WITH_DIRECT_CALLS && m
-	depends on X86_64 # has x86_64 inlined asm
+	depends on X86_64 || PPC64 # has inlined asm
 	help
 	  This builds an ftrace direct function example
 	  that hooks to wake_up_process and prints the parameters.
