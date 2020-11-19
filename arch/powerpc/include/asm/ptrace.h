@@ -62,6 +62,8 @@ struct pt_regs
 };
 #endif
 
+#define NR_REG_ARGUMENTS 8
+
 #ifdef __powerpc64__
 
 /*
@@ -85,8 +87,10 @@ struct pt_regs
 
 #ifdef PPC64_ELF_ABI_v2
 #define STACK_FRAME_MIN_SIZE	32
+#define STACK_FRAME_PARM_SAVE	32
 #else
 #define STACK_FRAME_MIN_SIZE	STACK_FRAME_OVERHEAD
+#define STACK_FRAME_PARM_SAVE	48
 #endif
 
 /* Size of dummy stack frame allocated when calling signal handler. */
@@ -103,6 +107,7 @@ struct pt_regs
 #define STACK_INT_FRAME_SIZE	(sizeof(struct pt_regs) + STACK_FRAME_OVERHEAD)
 #define STACK_FRAME_MARKER	2
 #define STACK_FRAME_MIN_SIZE	STACK_FRAME_OVERHEAD
+#define STACK_FRAME_PARM_SAVE	8
 
 /* Size of stack frame allocated when calling signal handler. */
 #define __SIGNAL_FRAMESIZE	64
@@ -309,6 +314,32 @@ static inline unsigned long regs_get_kernel_stack_nth(struct pt_regs *regs,
 		return 0;
 }
 
+/**
+ * regs_get_kernel_argument() - get Nth function argument in kernel
+ * @regs:	pt_regs of that context
+ * @n:		function argument number (start from 0)
+ *
+ * regs_get_argument() returns @n th argument of the function call.
+ * Note that this chooses most probable assignment, and is incorrect
+ * in scenarios where double or fp/vector parameters are involved.
+ * This also doesn't take into account stack alignment requirements.
+ *
+ * This is expected to be called from kprobes or ftrace with regs
+ * at function entry, so the current function has not setup its stack.
+ */
+static inline unsigned long regs_get_kernel_argument(struct pt_regs *regs,
+						     unsigned int n)
+{
+	if (n >= NR_REG_ARGUMENTS) {
+#ifndef __powerpc64__
+		n -= NR_REG_ARGUMENTS;
+#endif
+		n += STACK_FRAME_PARM_SAVE / sizeof(unsigned long);
+		return regs_get_kernel_stack_nth(regs, n);
+	} else {
+		return regs_get_register(regs, offsetof(struct pt_regs, gpr[n + 3]));
+	}
+}
 #endif /* __ASSEMBLY__ */
 
 #ifndef __powerpc64__
