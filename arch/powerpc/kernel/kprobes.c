@@ -107,6 +107,8 @@ int arch_prepare_kprobe(struct kprobe *p)
 {
 	int ret = 0;
 	struct kprobe *prev;
+	struct pt_regs regs;
+	struct instruction_op op;
 	struct ppc_inst insn = ppc_inst_read((struct ppc_inst *)p->addr);
 
 	if ((unsigned long)p->addr & 0x03) {
@@ -140,9 +142,18 @@ int arch_prepare_kprobe(struct kprobe *p)
 	if (!ret) {
 		patch_instruction((struct ppc_inst *)p->ainsn.insn, insn);
 		p->opcode = ppc_inst_val(insn);
+
+		/* Check if this is an instruction we recognise */
+		p->ainsn.boostable = 0;
+		memset(&regs, 0, sizeof(struct pt_regs));
+		regs.nip = (unsigned long)p->addr;
+		regs.msr = MSR_KERNEL;
+		ret = analyse_instr(&op, &regs, insn);
+		if (ret == 1 || (ret == 0 && GETTYPE(op.type) != UNKNOWN))
+			p->ainsn.boostable = 1;
+		ret = 0;
 	}
 
-	p->ainsn.boostable = 0;
 	return ret;
 }
 NOKPROBE_SYMBOL(arch_prepare_kprobe);
@@ -225,47 +236,6 @@ void arch_prepare_kretprobe(struct kretprobe_instance *ri, struct pt_regs *regs)
 }
 NOKPROBE_SYMBOL(arch_prepare_kretprobe);
 
-static int try_to_emulate(struct kprobe *p, struct pt_regs *regs)
-{
-	int ret;
-	struct ppc_inst insn = ppc_inst_read((struct ppc_inst *)p->ainsn.insn);
-
-	/* regs->nip is also adjusted if emulate_step returns 1 */
-	ret = emulate_step(regs, insn);
-	if (ret > 0) {
-		/*
-		 * Once this instruction has been boosted
-		 * successfully, set the boostable flag
-		 */
-		if (unlikely(p->ainsn.boostable == 0))
-			p->ainsn.boostable = 1;
-	} else if (ret < 0) {
-		/*
-		 * We don't allow kprobes on mtmsr(d)/rfi(d), etc.
-		 * So, we should never get here... but, its still
-		 * good to catch them, just in case...
-		 */
-		printk("Can't step on instruction %s\n", ppc_inst_as_str(insn));
-		BUG();
-	} else {
-		/*
-		 * If we haven't previously emulated this instruction, then it
-		 * can't be boosted. Note it down so we don't try to do so again.
-		 *
-		 * If, however, we had emulated this instruction in the past,
-		 * then this is just an error with the current run (for
-		 * instance, exceptions due to a load/store). We return 0 so
-		 * that this is now single-stepped, but continue to try
-		 * emulating it in subsequent probe hits.
-		 */
-		if (unlikely(p->ainsn.boostable != 1))
-			p->ainsn.boostable = -1;
-	}
-
-	return ret;
-}
-NOKPROBE_SYMBOL(try_to_emulate);
-
 int kprobe_handler(struct pt_regs *regs)
 {
 	struct kprobe *p;
@@ -334,8 +304,8 @@ int kprobe_handler(struct pt_regs *regs)
 		set_current_kprobe(p, regs, kcb);
 		kprobes_inc_nmissed_count(p);
 		kcb->kprobe_status = KPROBE_REENTER;
-		if (p->ainsn.boostable >= 0) {
-			ret = try_to_emulate(p, regs);
+		if (p->ainsn.boostable) {
+			ret = emulate_step(regs, ppc_inst_read((struct ppc_inst *)p->ainsn.insn));
 
 			if (ret > 0) {
 				restore_previous_kprobe(kcb);
@@ -356,8 +326,8 @@ int kprobe_handler(struct pt_regs *regs)
 		return 1;
 	}
 
-	if (p->ainsn.boostable >= 0) {
-		ret = try_to_emulate(p, regs);
+	if (p->ainsn.boostable) {
+		ret = emulate_step(regs, ppc_inst_read((struct ppc_inst *)p->ainsn.insn));
 
 		if (ret > 0) {
 			if (p->post_handler)
