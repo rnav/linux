@@ -105,56 +105,54 @@ kprobe_opcode_t *kprobe_lookup_name(const char *name, unsigned int offset)
 
 int arch_prepare_kprobe(struct kprobe *p)
 {
-	int ret = 0;
+	struct ppc_inst insn = ppc_inst_read((struct ppc_inst *)p->addr);
+	struct instruction_op op;
 	struct kprobe *prev;
 	struct pt_regs regs;
-	struct instruction_op op;
-	struct ppc_inst insn = ppc_inst_read((struct ppc_inst *)p->addr);
+	int ret = 0;
 
 	if ((unsigned long)p->addr & 0x03) {
-		printk("Attempt to register kprobe at an unaligned address\n");
-		ret = -EINVAL;
+		pr_info("Attempt to register kprobe at an unaligned address\n");
+		return -EINVAL;
 	} else if (IS_MTMSRD(insn) || IS_RFID(insn)) {
-		printk("Cannot register a kprobe on mtmsr[d]/rfi[d]\n");
-		ret = -EINVAL;
+		pr_info("Cannot register a kprobe on mtmsr[d]/rfi[d]\n");
+		return -EINVAL;
 	} else if ((unsigned long)p->addr & ~PAGE_MASK &&
 			ppc_inst_prefixed(ppc_inst_read((struct ppc_inst *)(p->addr - 1)))) {
-		printk("Cannot register a kprobe on the second word of prefixed instruction\n");
-		ret = -EINVAL;
+		pr_info("Cannot register a kprobe on the second word of prefixed instruction\n");
+		return -EINVAL;
 	}
+
+	/* Check if the previous instruction is a prefix instruction with an active kprobe */
 	preempt_disable();
 	prev = get_kprobe(p->addr - 1);
 	preempt_enable_no_resched();
-	if (prev &&
-	    ppc_inst_prefixed(ppc_inst_read((struct ppc_inst *)prev->ainsn.insn))) {
-		printk("Cannot register a kprobe on the second word of prefixed instruction\n");
-		ret = -EINVAL;
+	if (prev && ppc_inst_prefixed(ppc_inst_read((struct ppc_inst *)prev->ainsn.insn))) {
+		pr_info("Cannot register a kprobe on the second word of prefixed instruction\n");
+		return -EINVAL;
 	}
 
 	/* insn must be on a special executable page on ppc64.  This is
 	 * not explicitly required on ppc32 (right now), but it doesn't hurt */
-	if (!ret) {
-		p->ainsn.insn = get_insn_slot();
-		if (!p->ainsn.insn)
-			ret = -ENOMEM;
-	}
+	p->ainsn.insn = get_insn_slot();
+	if (!p->ainsn.insn)
+		return -ENOMEM;
 
-	if (!ret) {
-		patch_instruction((struct ppc_inst *)p->ainsn.insn, insn);
-		p->opcode = ppc_inst_val(insn);
+	if (patch_instruction((struct ppc_inst *)p->ainsn.insn, insn))
+		return -EFAULT;
 
-		/* Check if this is an instruction we recognise */
-		p->ainsn.boostable = 0;
-		memset(&regs, 0, sizeof(struct pt_regs));
-		regs.nip = (unsigned long)p->addr;
-		regs.msr = MSR_KERNEL;
-		ret = analyse_instr(&op, &regs, insn);
-		if (ret == 1 || (ret == 0 && GETTYPE(op.type) != UNKNOWN))
-			p->ainsn.boostable = 1;
-		ret = 0;
-	}
+	p->opcode = ppc_inst_val(insn);
 
-	return ret;
+	/* Check if this is an instruction we recognise */
+	p->ainsn.boostable = 0;
+	memset(&regs, 0, sizeof(struct pt_regs));
+	regs.nip = (unsigned long)p->addr;
+	regs.msr = MSR_KERNEL;
+	ret = analyse_instr(&op, &regs, insn);
+	if (ret == 1 || (ret == 0 && GETTYPE(op.type) != UNKNOWN))
+		p->ainsn.boostable = 1;
+
+	return 0;
 }
 NOKPROBE_SYMBOL(arch_prepare_kprobe);
 
