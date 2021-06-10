@@ -1677,7 +1677,7 @@ static int aggr_kprobe_disabled(struct kprobe *ap)
 }
 
 /* Disable one kprobe: Make sure called under kprobe_mutex is locked */
-static struct kprobe *__disable_kprobe(struct kprobe *p)
+static struct kprobe *__disable_kprobe(struct kprobe *p, int *disarmed)
 {
 	struct kprobe *orig_p;
 	int ret;
@@ -1704,7 +1704,8 @@ static struct kprobe *__disable_kprobe(struct kprobe *p)
 				if (ret) {
 					p->flags &= ~KPROBE_FLAG_DISABLED;
 					return ERR_PTR(ret);
-				}
+				} else if (disarmed)
+					*disarmed = 1;
 			}
 			orig_p->flags |= KPROBE_FLAG_DISABLED;
 		}
@@ -1719,9 +1720,10 @@ static struct kprobe *__disable_kprobe(struct kprobe *p)
 static int __unregister_kprobe_top(struct kprobe *p)
 {
 	struct kprobe *ap, *list_p;
+	int disarmed_now = 0;
 
 	/* Disable kprobe. This will disarm it if needed. */
-	ap = __disable_kprobe(p);
+	ap = __disable_kprobe(p, &disarmed_now);
 	if (IS_ERR(ap))
 		return PTR_ERR(ap);
 
@@ -1766,6 +1768,8 @@ noclean:
 	return 0;
 
 disarmed:
+	if (disarmed_now && !kprobe_ftrace(ap))
+		synchronize_rcu();
 	hlist_del_rcu(&ap->hlist);
 	return 0;
 }
@@ -2161,7 +2165,7 @@ int disable_kprobe(struct kprobe *kp)
 	mutex_lock(&kprobe_mutex);
 
 	/* Disable this kprobe */
-	p = __disable_kprobe(kp);
+	p = __disable_kprobe(kp, NULL);
 	if (IS_ERR(p))
 		ret = PTR_ERR(p);
 
