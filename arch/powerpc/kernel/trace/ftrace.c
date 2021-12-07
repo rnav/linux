@@ -1137,3 +1137,14 @@ char *arch_ftrace_match_adjust(char *str, const char *search)
 		return str;
 }
 #endif /* PPC64_ELF_ABI_v1 */
+
+#ifdef CONFIG_MPROFILE_KERNEL
+unsigned long ftrace_location_lookup(unsigned long ip)
+{
+	/*
+	 * Per livepatch.h, ftrace location is always within the first
+	 * 16 bytes of a function on powerpc with -mprofile-kernel.
+	 */
+	return ftrace_location_range(ip, ip + 16);
+}
+#endif
