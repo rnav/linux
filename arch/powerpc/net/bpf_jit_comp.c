@@ -220,13 +220,15 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *fp)
 	extable_len = fp->aux->num_exentries * sizeof(struct exception_table_entry);
 
 	proglen = cgctx.idx * 4;
-	alloclen = proglen + FUNCTION_DESCR_SIZE + fixup_len + extable_len;
+	alloclen = proglen + FUNCTION_DESCR_SIZE + fixup_len + extable_len + BPF_TRAMP_STUB_SIZE * 2;
 
 	bpf_hdr = bpf_jit_binary_alloc(alloclen, &image, 4, bpf_jit_fill_ill_insns);
 	if (!bpf_hdr) {
 		fp = org_fp;
 		goto out_addrs;
 	}
+
+	image += BPF_TRAMP_STUB_SIZE * 2;
 
 	if (extable_len)
 		fp->aux->extable = (void *)image + FUNCTION_DESCR_SIZE + proglen + fixup_len;
@@ -251,6 +253,7 @@ skip_init_ctx:
 	}
 
 	/* Code generation passes 1-2 */
+	*(code_base - 1) = PPC_BPF_MAGIC();
 	for (pass = 1; pass < 3; pass++) {
 		/* Now build the prologue, body code & epilogue for real. */
 		cgctx.idx = 0;
