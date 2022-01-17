@@ -13,6 +13,7 @@
 #include <linux/netdevice.h>
 #include <linux/filter.h>
 #include <linux/if_vlan.h>
+#include <linux/memory.h>
 #include <asm/kprobes.h>
 #include <linux/bpf.h>
 #include <asm/security_features.h>
@@ -126,8 +127,12 @@ void bpf_jit_build_prologue(u32 *image, struct codegen_context *ctx)
 {
 	int i;
 
-	if (IS_ENABLED(CONFIG_PPC64_ELF_ABI_V2))
+	if (IS_ENABLED(CONFIG_PPC64_ELF_ABI_V2)) {
+		/* two nops for trampoline attach */
+		EMIT(PPC_RAW_NOP());
+		EMIT(PPC_RAW_NOP());
 		EMIT(PPC_RAW_LD(_R2, _R13, offsetof(struct paca_struct, kernel_toc)));
+	}
 
 	/*
 	 * Initialize tail_call_cnt if we do tail calls.
@@ -267,7 +272,7 @@ static int bpf_jit_emit_tail_call(u32 *image, struct codegen_context *ctx, u32 o
 	int bpf_tailcall_prologue_size = 8;
 
 	if (IS_ENABLED(CONFIG_PPC64_ELF_ABI_V2))
-		bpf_tailcall_prologue_size += 4; /* skip past the toc load */
+		bpf_tailcall_prologue_size += 12; /* skip past the toc load and trampoline stub */
 
 	/*
 	 * if (index >= array->map.max_entries)
@@ -1206,3 +1211,609 @@ cond_branch:
 
 	return 0;
 }
+
+#ifdef CONFIG_PPC64_ELF_ABI_V2
+
+static __always_inline int bpf_check_and_patch(u32 *ip, ppc_inst_t old_inst, ppc_inst_t new_inst)
+{
+	ppc_inst_t org_inst = ppc_inst_read(ip);
+	if (!ppc_inst_equal(org_inst, old_inst)) {
+		pr_info("bpf_check_and_patch: ip: 0x%lx, org_inst(0x%x) != old_inst (0x%x)\n",
+				(unsigned long)ip, ppc_inst_val(org_inst), ppc_inst_val(old_inst));
+		return -EBUSY;
+	}
+	if (ppc_inst_equal(org_inst, new_inst))
+		return 1;
+	return patch_instruction(ip, new_inst);
+}
+
+static u32 *bpf_find_existing_stub(u32 *ip, enum bpf_text_poke_type t, void *old_addr)
+{
+	int branch_flags = t == BPF_MOD_JUMP ? 0 : BRANCH_SET_LINK;
+	u32 *stub_addr = 0, *stub1, *stub2;
+	ppc_inst_t org_inst, old_inst;
+
+	if (!old_addr)
+		return 0;
+
+	stub1 = ip - (BPF_TRAMP_STUB_SIZE / sizeof(u32)) - (t == BPF_MOD_CALL ? 1 : 0);
+	stub2 = stub1 - (BPF_TRAMP_STUB_SIZE / sizeof(u32));
+	org_inst = ppc_inst_read(ip);
+	if (!create_branch(&old_inst, ip, (unsigned long)stub1, branch_flags) &&
+	    ppc_inst_equal(org_inst, old_inst))
+		stub_addr = stub1;
+	if (!create_branch(&old_inst, ip, (unsigned long)stub2, branch_flags) &&
+	    ppc_inst_equal(org_inst, old_inst))
+		stub_addr = stub2;
+
+	return stub_addr;
+}
+
+static u32 *bpf_setup_stub(u32 *ip, enum bpf_text_poke_type t, void *old_addr, void *new_addr)
+{
+	u32 *stub_addr, *stub1, *stub2;
+	ppc_inst_t org_inst, old_inst;
+	int i, ret;
+	u32 stub[] = {
+		PPC_RAW_LIS(12, 0),
+		PPC_RAW_ORI(12, 12, 0),
+		PPC_RAW_SLDI(12, 12, 32),
+		PPC_RAW_ORIS(12, 12, 0),
+		PPC_RAW_ORI(12, 12, 0),
+		PPC_RAW_MTCTR(12),
+		PPC_RAW_BCTR(),
+	};
+
+	/* verify we are patching the right location */
+	if (t == BPF_MOD_JUMP)
+		org_inst = ppc_inst_read(ip - 1);
+	else
+		org_inst = ppc_inst_read(ip - 2);
+	old_inst = ppc_inst(PPC_BPF_MAGIC());
+	if (!ppc_inst_equal(org_inst, old_inst))
+		return 0;
+
+	/* verify existing branch and note down the stub to use */
+	stub1 = ip - (BPF_TRAMP_STUB_SIZE / sizeof(u32)) - (t == BPF_MOD_CALL ? 1 : 0);
+	stub2 = stub1 - (BPF_TRAMP_STUB_SIZE / sizeof(u32));
+	stub_addr = 0;
+	org_inst = ppc_inst_read(ip);
+	if (old_addr) {
+		stub_addr = bpf_find_existing_stub(ip, t, old_addr);
+		/* existing instruction should branch to one of the two stubs */
+		if (!stub_addr)
+			return 0;
+	} else {
+		old_inst = ppc_inst(PPC_RAW_NOP());
+		if (!ppc_inst_equal(org_inst, old_inst))
+			return 0;
+	}
+	if (stub_addr == stub1)
+		stub_addr = stub2;
+	else
+		stub_addr = stub1;
+
+	/* setup stub */
+	stub[0] |= IMM_L((unsigned long)new_addr >> 48);
+	stub[1] |= IMM_L((unsigned long)new_addr >> 32);
+	stub[3] |= IMM_L((unsigned long)new_addr >> 16);
+	stub[4] |= IMM_L((unsigned long)new_addr);
+	for (i = 0; i < sizeof(stub) / sizeof(u32); i++) {
+		ret = patch_instruction(stub_addr + i, ppc_inst(stub[i]));
+		if (ret) {
+			pr_err("bpf: patch_instruction() error while setting up stub: ret %d\n", ret);
+			return 0;
+		}
+	}
+
+	return stub_addr;
+}
+
+int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type t, void *old_addr, void *new_addr)
+{
+	ppc_inst_t org_inst, old_inst, new_inst;
+	int ret = -EINVAL;
+	u32 *stub_addr;
+
+	/* We currently only support poking bpf programs */
+	if (!is_bpf_text_address((long)ip)) {
+		pr_info("bpf_arch_text_poke (0x%lx): kernel/modules are not supported\n", (unsigned long)ip);
+		return -EINVAL;
+	}
+
+	mutex_lock(&text_mutex);
+	if (t == BPF_MOD_JUMP) {
+		/*
+		 * This can point to the beginning of a bpf program, or to certain locations
+		 * within a bpf program. We operate on a single instruction at ip here,
+		 * converting among a nop and an unconditional branch. Depending on branch
+		 * target, we may use the stub area at the beginning of the bpf program and
+		 * we assume that BPF_MOD_JUMP and BPF_MOD_CALL are never used without
+		 * transitioning to a nop.
+		 */
+		if (!old_addr && new_addr) {
+			/* nop -> b */
+			old_inst = ppc_inst(PPC_RAW_NOP());
+			if (create_branch(&new_inst, (u32 *)ip, (unsigned long)new_addr, 0)) {
+				stub_addr = bpf_setup_stub(ip, t, old_addr, new_addr);
+				if (!stub_addr ||
+				    create_branch(&new_inst, (u32 *)ip, (unsigned long)stub_addr, 0)) {
+					ret = -EINVAL;
+					goto out;
+				}
+			}
+			ret = bpf_check_and_patch(ip, old_inst, new_inst);
+		} else if (old_addr && !new_addr) {
+			/* b -> nop */
+			new_inst = ppc_inst(PPC_RAW_NOP());
+			if (create_branch(&old_inst, (u32 *)ip, (unsigned long)old_addr, 0)) {
+				stub_addr = bpf_find_existing_stub(ip, t, old_addr);
+				if (!stub_addr ||
+				    create_branch(&old_inst, (u32 *)ip, (unsigned long)stub_addr, 0)) {
+					ret = -EINVAL;
+					goto out;
+				}
+			}
+			ret = bpf_check_and_patch(ip, old_inst, new_inst);
+		} else if (old_addr && new_addr) {
+			/* b -> b */
+			stub_addr = 0;
+			if (create_branch(&old_inst, (u32 *)ip, (unsigned long)old_addr, 0)) {
+				stub_addr = bpf_find_existing_stub(ip, t, old_addr);
+				if (!stub_addr ||
+				    create_branch(&old_inst, (u32 *)ip, (unsigned long)stub_addr, 0)) {
+					ret = -EINVAL;
+					goto out;
+				}
+			}
+			if (create_branch(&new_inst, (u32 *)ip, (unsigned long)new_addr, 0)) {
+				stub_addr = bpf_setup_stub(ip, t, old_addr, new_addr);
+				if (!stub_addr ||
+				    create_branch(&new_inst, (u32 *)ip, (unsigned long)stub_addr, 0)) {
+					ret = -EINVAL;
+					goto out;
+				}
+			}
+			ret = bpf_check_and_patch((u32 *)ip, old_inst, new_inst);
+		}
+	} else if (t == BPF_MOD_CALL) {
+		/*
+		 * For a BPF_MOD_CALL, we expect ip to point at the start of a bpf program.
+		 * We will have to patch two instructions to mimic -mprofile-kernel: a 'mflr r0'
+		 * followed by a 'bl'. Instruction patching order matters: we always patch-in
+		 * the 'mflr r0' first and patch it out the last.
+		 */
+		if (!old_addr && new_addr) {
+			/* nop -> bl */
+
+			/* confirm that we have two nops */
+			old_inst = ppc_inst(PPC_RAW_NOP());
+			org_inst = ppc_inst_read(ip);
+			if (!ppc_inst_equal(org_inst, old_inst)) {
+				ret = -EINVAL;
+				goto out;
+			}
+			org_inst = ppc_inst_read((u32 *)ip + 1);
+			if (!ppc_inst_equal(org_inst, old_inst)) {
+				ret = -EINVAL;
+				goto out;
+			}
+
+			/* patch in the mflr */
+			new_inst = ppc_inst(PPC_RAW_MFLR(_R0));
+			ret = bpf_check_and_patch(ip, old_inst, new_inst);
+			if (ret)
+				goto out;
+
+			/* prep the stub if needed */
+			ip = (u32 *)ip + 1;
+			if (create_branch(&new_inst, (u32 *)ip, (unsigned long)new_addr, BRANCH_SET_LINK)) {
+				stub_addr = bpf_setup_stub(ip, t, old_addr, new_addr);
+				if (!stub_addr ||
+				    create_branch(&new_inst, (u32 *)ip, (unsigned long)stub_addr, BRANCH_SET_LINK)) {
+					ret = -EINVAL;
+					goto out;
+				}
+			}
+
+			synchronize_rcu();
+
+			/* patch in the bl */
+			ret = bpf_check_and_patch(ip, old_inst, new_inst);
+		} else if (old_addr && !new_addr) {
+			/* bl -> nop */
+
+			/* confirm the expected instruction sequence */
+			old_inst = ppc_inst(PPC_RAW_MFLR(_R0));
+			org_inst = ppc_inst_read(ip);
+			if (!ppc_inst_equal(org_inst, old_inst)) {
+				ret = -EINVAL;
+				goto out;
+			}
+			ip = (u32 *)ip + 1;
+			org_inst = ppc_inst_read(ip);
+			if (create_branch(&old_inst, (u32 *)ip, (unsigned long)old_addr, BRANCH_SET_LINK)) {
+				stub_addr = bpf_find_existing_stub(ip, t, old_addr);
+				if (!stub_addr ||
+				    create_branch(&old_inst, (u32 *)ip, (unsigned long)stub_addr, BRANCH_SET_LINK)) {
+					ret = -EINVAL;
+					goto out;
+				}
+			}
+			if (!ppc_inst_equal(org_inst, old_inst)) {
+				ret = -EINVAL;
+				goto out;
+			}
+
+			/* patch out the branch first */
+			new_inst = ppc_inst(PPC_RAW_NOP());
+			ret = bpf_check_and_patch(ip, old_inst, new_inst);
+			if (ret)
+				goto out;
+
+			synchronize_rcu();
+
+			/* then, the mflr */
+			old_inst = ppc_inst(PPC_RAW_MFLR(_R0));
+			ret = bpf_check_and_patch((u32 *)ip - 1, old_inst, new_inst);
+		} else if (old_addr && new_addr) {
+			/* bl -> bl */
+
+			/* confirm the expected instruction sequence */
+			old_inst = ppc_inst(PPC_RAW_MFLR(_R0));
+			org_inst = ppc_inst_read(ip);
+			if (!ppc_inst_equal(org_inst, old_inst)) {
+				ret = -EINVAL;
+				goto out;
+			}
+			ip = (u32 *)ip + 1;
+			org_inst = ppc_inst_read(ip);
+			if (create_branch(&old_inst, (u32 *)ip, (unsigned long)old_addr, BRANCH_SET_LINK)) {
+				stub_addr = bpf_find_existing_stub(ip, t, old_addr);
+				if (!stub_addr ||
+				    create_branch(&old_inst, (u32 *)ip, (unsigned long)stub_addr, BRANCH_SET_LINK)) {
+					ret = -EINVAL;
+					goto out;
+				}
+			}
+			if (!ppc_inst_equal(org_inst, old_inst)) {
+				ret = -EINVAL;
+				goto out;
+			}
+
+			/* setup the new branch */
+			if (create_branch(&new_inst, (u32 *)ip, (unsigned long)new_addr, BRANCH_SET_LINK)) {
+				stub_addr = bpf_setup_stub(ip, t, old_addr, new_addr);
+				if (!stub_addr ||
+				    create_branch(&new_inst, (u32 *)ip, (unsigned long)stub_addr, BRANCH_SET_LINK)) {
+					ret = -EINVAL;
+					goto out;
+				}
+			}
+			ret = bpf_check_and_patch(ip, old_inst, new_inst);
+		}
+	}
+
+out:
+	mutex_unlock(&text_mutex);
+	return ret;
+}
+
+/*
+ * BPF Trampoline stack frame layout:
+ *
+ *		[	prev sp		] <-----
+ *		[   BPF_TRAMP_R26_SAVE	] 8	|
+ *		[   BPF_TRAMP_R25_SAVE	] 8	|
+ *		[   BPF_TRAMP_LR_SAVE	] 8	|
+ *		[       ret val		] 8	|
+ *		[   BPF_TRAMP_PROG_CTX	] 8 * 8	|
+ *		[ BPF_TRAMP_FUNC_ARG_CNT] 8	|
+ *		[   BPF_TRAMP_FUNC_IP	] 8	|
+ *		[   BPF_TRAMP_RUN_CTX	] <var>	|
+ * sp (r1) --->	[   stack frame header	] ------
+ */
+
+/* stack frame header + data, quadword aligned */
+#define BPF_TRAMP_FRAME_SIZE	round_up(STACK_FRAME_MIN_SIZE + (14 * 8) + \
+					 round_up(sizeof(struct bpf_tramp_run_ctx), 8), 16)
+
+/* The below are offsets from r1 */
+/* upto 8 dword func parameters, as bpf prog ctx */
+#define BPF_TRAMP_PROG_CTX	(BPF_TRAMP_FRAME_SIZE - (12 * 8))
+/* bpf_get_func_arg_cnt() needs this before prog ctx */
+#define BPF_TRAMP_FUNC_ARG_CNT	(BPF_TRAMP_PROG_CTX - 8)
+/* bpf_get_func_ip() needs this here */
+#define BPF_TRAMP_FUNC_IP	(BPF_TRAMP_PROG_CTX - 16)
+#define BPF_TRAMP_RUN_CTX	(BPF_TRAMP_FUNC_IP - round_up(sizeof(struct bpf_tramp_run_ctx), 8))
+/* lr save area, after space for upto 8 args followed by retval of orig_call/fentry progs */
+#define BPF_TRAMP_LR_SAVE	(BPF_TRAMP_PROG_CTX + (8 * 8) + 8)
+#define BPF_TRAMP_R25_SAVE	(BPF_TRAMP_LR_SAVE + 8)
+#define BPF_TRAMP_R26_SAVE	(BPF_TRAMP_R25_SAVE + 8)
+
+#define BPF_INSN_SAFETY		64
+
+static int invoke_bpf_prog(const struct btf_func_model *m, u32 *image, struct codegen_context *ctx,
+			   struct bpf_tramp_link *l, bool save_ret)
+{
+	struct bpf_prog *p = l->link.prog;
+	ppc_inst_t branch_insn;
+	u32 jmp_idx;
+	int ret;
+
+	/* save cookie */
+	PPC_LI64(_R3, l->cookie);
+	EMIT(PPC_RAW_STD(_R3, _R1, BPF_TRAMP_RUN_CTX + offsetof(struct bpf_tramp_run_ctx, bpf_cookie)));
+
+	/* __bpf_prog_enter(p) */
+	PPC_LI64(_R3, (unsigned long)p);
+	EMIT(PPC_RAW_MR(_R25, _R3));
+	EMIT(PPC_RAW_ADDI(_R4, _R1, BPF_TRAMP_RUN_CTX));
+	ret = bpf_jit_emit_func_call_hlp(image, ctx,
+			p->aux->sleepable ? (u64)__bpf_prog_enter_sleepable : (u64)__bpf_prog_enter);
+	if (ret)
+		return ret;
+
+	/* remember prog start time returned by __bpf_prog_enter */
+	EMIT(PPC_RAW_MR(_R26, _R3));
+
+	/*
+	 * if (__bpf_prog_enter(p) == 0)
+	 *	goto skip_exec_of_prog;
+	 *
+	 * emit a nop to be later patched with conditional branch, once offset is known
+	 */
+	EMIT(PPC_RAW_CMPDI(_R3, 0));
+	jmp_idx = ctx->idx;
+	EMIT(PPC_RAW_NOP());
+
+	/* p->bpf_func() */
+	EMIT(PPC_RAW_ADDI(_R3, _R1, BPF_TRAMP_PROG_CTX));
+	if (!p->jited)
+		PPC_LI64(_R4, (unsigned long)p->insnsi);
+	if (is_offset_in_branch_range((unsigned long)p->bpf_func - (unsigned long)&image[ctx->idx])) {
+		PPC_BL((unsigned long)p->bpf_func);
+	} else {
+		EMIT(PPC_RAW_LD(_R12, _R25, offsetof(struct bpf_prog, bpf_func)));
+		EMIT(PPC_RAW_MTCTR(_R12));
+		EMIT(PPC_RAW_BCTRL());
+	}
+
+	if (save_ret)
+		EMIT(PPC_RAW_STD(_R3, _R1, BPF_TRAMP_PROG_CTX + (m->nr_args * 8)));
+
+	/* fix up branch */
+	if (create_cond_branch(&branch_insn, &image[jmp_idx], (unsigned long)&image[ctx->idx], COND_EQ << 16))
+		return -EINVAL;
+	image[jmp_idx] = ppc_inst_val(branch_insn);
+
+	/* __bpf_prog_exit(p, start_time) */
+	EMIT(PPC_RAW_MR(_R3, _R25));
+	EMIT(PPC_RAW_MR(_R4, _R26));
+	EMIT(PPC_RAW_ADDI(_R5, _R1, BPF_TRAMP_RUN_CTX));
+	ret = bpf_jit_emit_func_call_hlp(image, ctx,
+			p->aux->sleepable ? (u64)__bpf_prog_exit_sleepable : (u64)__bpf_prog_exit);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int invoke_bpf(const struct btf_func_model *m, u32 *image, struct codegen_context *ctx,
+		      struct bpf_tramp_links *tl, bool save_ret)
+{
+	int i;
+
+	for (i = 0; i < tl->nr_links; i++) {
+		if (invoke_bpf_prog(m, image, ctx, tl->links[i], save_ret))
+			return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int invoke_bpf_mod_ret(const struct btf_func_model *m, u32 *image, struct codegen_context *ctx,
+			      struct bpf_tramp_links *tl, u32 *branches)
+{
+	int i;
+
+	/*
+	 * The first fmod_ret program will receive a garbage return value.
+	 * Set this to 0 to avoid confusing the program.
+	 */
+	EMIT(PPC_RAW_LI(_R3, 0));
+	EMIT(PPC_RAW_STD(_R3, _R1, BPF_TRAMP_PROG_CTX + (m->nr_args * 8)));
+	for (i = 0; i < tl->nr_links; i++) {
+		if (invoke_bpf_prog(m, image, ctx, tl->links[i], true))
+			return -EINVAL;
+
+		/*
+		 * mod_ret prog stored return value after prog ctx. Emit:
+		 * if (*(u64 *)(ret_val) !=  0)
+		 *	goto do_fexit;
+		 */
+		EMIT(PPC_RAW_LD(_R3, _R1, BPF_TRAMP_PROG_CTX + (m->nr_args * 8)));
+		EMIT(PPC_RAW_CMPDI(_R3, 0));
+
+		/*
+		 * Save the location of the branch and generate a nop, which is
+		 * replaced with a conditional jump once do_fexit (i.e. the
+		 * start of the fexit invocation) is finalized.
+		 */
+		branches[i] = ctx->idx;
+		EMIT(PPC_RAW_NOP());
+	}
+
+	return 0;
+}
+
+/*
+ * We assume that orig_call is what this trampoline is being attached to and we use the link
+ * register for BPF_TRAMP_F_CALL_ORIG -- see is_valid_bpf_tramp_flags() for validating this.
+ */
+int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image_start, void *image_end,
+				const struct btf_func_model *m, u32 flags,
+				struct bpf_tramp_links *tlinks,
+				void *orig_call __maybe_unused)
+{
+	bool save_ret = flags & (BPF_TRAMP_F_CALL_ORIG | BPF_TRAMP_F_RET_FENTRY_RET);
+	struct bpf_tramp_links *fentry = &tlinks[BPF_TRAMP_FENTRY];
+	struct bpf_tramp_links *fexit = &tlinks[BPF_TRAMP_FEXIT];
+	struct bpf_tramp_links *fmod_ret = &tlinks[BPF_TRAMP_MODIFY_RETURN];
+	struct codegen_context codegen_ctx, *ctx;
+	int i, ret, nr_args = m->nr_args;
+	u32 *image = (u32 *)image_start;
+	ppc_inst_t branch_insn;
+	u32 *branches = NULL;
+
+	if (nr_args > 8)
+		return -EINVAL;
+
+	ctx = &codegen_ctx;
+	memset(ctx, 0, sizeof(*ctx));
+
+	/*
+	 * Prologue for the trampoline follows ftrace -mprofile-kernel ABI.
+	 * On entry, LR has our return address while r0 has original return address.
+	 *	std	r0, 16(r1)
+	 *	stdu	r1, -144(r1)
+	 *	mflr	r0
+	 *	std	r0, 112(r1)
+	 *	std	r2, 24(r1)
+	 *	ld	r2, PACATOC(r13)
+	 *	std	r3, 40(r1)
+	 *	std	r4, 48(r2)
+	 *	...
+	 *	std	r25, 120(r1)
+	 *	std	r26, 128(r1)
+	 */
+	EMIT(PPC_RAW_STD(_R0, _R1, PPC_LR_STKOFF));
+	EMIT(PPC_RAW_STDU(_R1, _R1, -BPF_TRAMP_FRAME_SIZE));
+	EMIT(PPC_RAW_MFLR(_R0));
+	EMIT(PPC_RAW_STD(_R0, _R1, BPF_TRAMP_LR_SAVE));
+	EMIT(PPC_RAW_STD(_R2, _R1, 24));
+	EMIT(PPC_RAW_LD(_R2, _R13, offsetof(struct paca_struct, kernel_toc)));
+	for (i = 0; i < nr_args; i++)
+		EMIT(PPC_RAW_STD(_R3 + i, _R1, BPF_TRAMP_PROG_CTX + (i * 8)));
+	EMIT(PPC_RAW_STD(_R25, _R1, BPF_TRAMP_R25_SAVE));
+	EMIT(PPC_RAW_STD(_R26, _R1, BPF_TRAMP_R26_SAVE));
+
+	/* save function arg count -- see bpf_get_func_arg_cnt() */
+	EMIT(PPC_RAW_LI(_R3, nr_args));
+	EMIT(PPC_RAW_STD(_R3, _R1, BPF_TRAMP_FUNC_ARG_CNT));
+
+	/* save nip of the traced function before bpf prog ctx -- see bpf_get_func_ip() */
+	if (flags & BPF_TRAMP_F_IP_ARG) {
+		/* TODO: should this be GEP? */
+		EMIT(PPC_RAW_ADDI(_R3, _R0, -8));
+		EMIT(PPC_RAW_STD(_R3, _R1, BPF_TRAMP_FUNC_IP));
+	}
+
+	if (flags & BPF_TRAMP_F_CALL_ORIG) {
+		PPC_LI64(_R3, (unsigned long)im);
+		ret = bpf_jit_emit_func_call_hlp(image, ctx, (u64)__bpf_tramp_enter);
+		if (ret)
+			return ret;
+	}
+
+	if (fentry->nr_links)
+		if (invoke_bpf(m, image, ctx, fentry, flags & BPF_TRAMP_F_RET_FENTRY_RET))
+			return -EINVAL;
+
+	if (fmod_ret->nr_links) {
+		branches = kcalloc(fmod_ret->nr_links, sizeof(u32), GFP_KERNEL);
+		if (!branches)
+			return -ENOMEM;
+
+		if (invoke_bpf_mod_ret(m, image, ctx, fmod_ret, branches)) {
+			ret = -EINVAL;
+			goto cleanup;
+		}
+	}
+
+	/* call original function */
+	if (flags & BPF_TRAMP_F_CALL_ORIG) {
+		EMIT(PPC_RAW_LD(_R3, _R1, BPF_TRAMP_LR_SAVE));
+		EMIT(PPC_RAW_MTCTR(_R3));
+
+		/* restore args */
+		for (i = 0; i < nr_args; i++)
+			EMIT(PPC_RAW_LD(_R3 + i, _R1, BPF_TRAMP_PROG_CTX + (i * 8)));
+
+		EMIT(PPC_RAW_LD(_R2, _R1, 24));
+		EMIT(PPC_RAW_BCTRL());
+		EMIT(PPC_RAW_LD(_R2, _R13, offsetof(struct paca_struct, kernel_toc)));
+
+		/* remember return value in a stack for bpf prog to access */
+		EMIT(PPC_RAW_STD(_R3, _R1, BPF_TRAMP_PROG_CTX + (nr_args * 8)));
+
+		/* reserve space to patch branch instruction to skip fexit progs */
+		im->ip_after_call = &image[ctx->idx];
+		EMIT(PPC_RAW_NOP());
+	}
+
+	if (fmod_ret->nr_links) {
+		/* update branches saved in invoke_bpf_mod_ret with aligned address of do_fexit */
+		for (i = 0; i < fmod_ret->nr_links; i++) {
+			if (create_cond_branch(&branch_insn, &image[branches[i]],
+					       (unsigned long)&image[ctx->idx], COND_NE << 16)) {
+				ret = -EINVAL;
+				goto cleanup;
+			}
+
+			image[branches[i]] = ppc_inst_val(branch_insn);
+		}
+	}
+
+	if (fexit->nr_links)
+		if (invoke_bpf(m, image, ctx, fexit, false)) {
+			ret = -EINVAL;
+			goto cleanup;
+		}
+
+	if (flags & BPF_TRAMP_F_RESTORE_REGS)
+		for (i = 0; i < nr_args; i++)
+			EMIT(PPC_RAW_LD(_R3 + i, _R1, BPF_TRAMP_PROG_CTX + (i * 8)));
+
+	if (flags & BPF_TRAMP_F_CALL_ORIG) {
+		im->ip_epilogue = &image[ctx->idx];
+		PPC_LI64(_R3, (unsigned long)im);
+		ret = bpf_jit_emit_func_call_hlp(image, ctx, (u64)__bpf_tramp_exit);
+		if (ret)
+			goto cleanup;
+	}
+
+	/* restore return value of orig_call or fentry prog */
+	if (save_ret)
+		EMIT(PPC_RAW_LD(_R3, _R1, BPF_TRAMP_PROG_CTX + (nr_args * 8)));
+
+	/* epilogue */
+	EMIT(PPC_RAW_LD(_R26, _R1, BPF_TRAMP_R26_SAVE));
+	EMIT(PPC_RAW_LD(_R25, _R1, BPF_TRAMP_R25_SAVE));
+	EMIT(PPC_RAW_LD(_R2, _R1, 24));
+	if (flags & BPF_TRAMP_F_SKIP_FRAME) {
+		/* skip our return address and return to parent */
+		EMIT(PPC_RAW_ADDI(_R1, _R1, BPF_TRAMP_FRAME_SIZE));
+		EMIT(PPC_RAW_LD(_R0, _R1, PPC_LR_STKOFF));
+		EMIT(PPC_RAW_MTCTR(_R0));
+	} else {
+		EMIT(PPC_RAW_LD(_R0, _R1, BPF_TRAMP_LR_SAVE));
+		EMIT(PPC_RAW_MTCTR(_R0));
+		EMIT(PPC_RAW_ADDI(_R1, _R1, BPF_TRAMP_FRAME_SIZE));
+		EMIT(PPC_RAW_LD(_R0, _R1, PPC_LR_STKOFF));
+		EMIT(PPC_RAW_MTLR(_R0));
+	}
+	EMIT(PPC_RAW_BCTR());
+
+	/* make sure the trampoline generation logic doesn't overflow */
+	if (WARN_ON_ONCE(&image[ctx->idx] > (u32 *)image_end - BPF_INSN_SAFETY)) {
+		ret = -EFAULT;
+		goto cleanup;
+	}
+	ret = (u8 *)&image[ctx->idx] - (u8 *)image;
+
+cleanup:
+	kfree(branches);
+	return ret;
+}
+#endif

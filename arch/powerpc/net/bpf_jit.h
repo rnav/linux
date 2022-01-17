@@ -19,6 +19,14 @@
 #define FUNCTION_DESCR_SIZE	0
 #endif
 
+#ifdef CONFIG_PPC64_ELF_ABI_V2
+#define BPF_TRAMP_STUB_SIZE	32
+#else
+#define BPF_TRAMP_STUB_SIZE	0
+#endif
+
+#define PPC_BPF_MAGIC()			(0xeB9FC0DE)
+
 #define PLANT_INSTR(d, idx, instr)					      \
 	do { if (d) { (d)[idx] = instr; } idx++; } while (0)
 #define EMIT(instr)		PLANT_INSTR(image, ctx->idx, instr)
