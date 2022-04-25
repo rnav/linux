@@ -121,7 +121,6 @@ int __weak
 arch_kexec_apply_relocations_add(struct purgatory_info *pi, Elf_Shdr *section,
 				 const Elf_Shdr *relsec, const Elf_Shdr *symtab)
 {
-	pr_err("RELA relocation unsupported.\n");
 	return -ENOEXEC;
 }
 
@@ -138,7 +137,6 @@ int __weak
 arch_kexec_apply_relocations(struct purgatory_info *pi, Elf_Shdr *section,
 			     const Elf_Shdr *relsec, const Elf_Shdr *symtab)
 {
-	pr_err("REL relocation unsupported.\n");
 	return -ENOEXEC;
 }
 
