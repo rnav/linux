@@ -50,6 +50,7 @@ static char gpfx;	/* prefix for global symbol name (sometimes '_') */
 static struct stat sb;	/* Remember .st_size, etc. */
 static const char *altmcount;	/* alternate mcount symbol name */
 static int warn_on_notrace_sect; /* warn when section has mcount not being recorded */
+static int allow_weak_sym_rel; /* allow relocations using weak symbols */
 static void *file_map;	/* pointer of the mapped file */
 static void *file_end;	/* pointer to the end of the mapped file */
 static int file_updated; /* flag to state file was changed */
@@ -631,8 +632,11 @@ int main(int argc, char *argv[])
 	int c;
 	int i;
 
-	while ((c = getopt(argc, argv, "w")) >= 0) {
+	while ((c = getopt(argc, argv, "aw")) >= 0) {
 		switch (c) {
+		case 'a':
+			allow_weak_sym_rel = 1;
+			break;
 		case 'w':
 			warn_on_notrace_sect = 1;
 			break;

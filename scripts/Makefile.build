@@ -199,6 +199,9 @@ ifdef BUILD_C_RECORDMCOUNT
 ifeq ("$(origin RECORDMCOUNT_WARN)", "command line")
   RECORDMCOUNT_FLAGS = -w
 endif
+ifdef HAVE_MCOUNT_LOC_VALIDATION
+  RECORDMCOUNT_FLAGS += -a
+endif
 # Due to recursion, we must skip empty.o.
 # The empty.o file is created in the make process in order to determine
 # the target endianness and word size. It is made before all other C

@@ -858,6 +858,10 @@ ifdef CONFIG_FTRACE_MCOUNT_USE_RECORDMCOUNT
     BUILD_C_RECORDMCOUNT := y
     export BUILD_C_RECORDMCOUNT
   endif
+  ifdef CONFIG_HAVE_MCOUNT_LOC_VALIDATION
+    HAVE_MCOUNT_LOC_VALIDATION := y
+    export HAVE_MCOUNT_LOC_VALIDATION
+  endif
 endif
 ifdef CONFIG_HAVE_FENTRY
   # s390-linux-gnu-gcc did not support -mfentry until gcc-9.

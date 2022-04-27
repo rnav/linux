@@ -12,13 +12,7 @@
 
 #ifndef __ASSEMBLY__
 extern void _mcount(void);
-
-static inline unsigned long ftrace_call_adjust(unsigned long addr)
-{
-       /* relocation of mcount call site is the same as the address */
-       return addr;
-}
-
+unsigned long ftrace_call_adjust(unsigned long addr);
 unsigned long prepare_ftrace_return(unsigned long parent, unsigned long ip,
 				    unsigned long sp);
 

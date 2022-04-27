@@ -858,6 +858,17 @@ void arch_ftrace_update_code(int command)
 	ftrace_modify_all_code(command);
 }
 
+unsigned long ftrace_call_adjust(unsigned long addr)
+{
+	ppc_inst_t op = ppc_inst_read((u32 *)addr);
+
+	if (!is_bl_op(op))
+		return 0;
+
+	/* relocation of mcount call site is the same as the address */
+	return addr;
+}
+
 #ifdef CONFIG_PPC64
 #define PACATOC offsetof(struct paca_struct, kernel_toc)
 
