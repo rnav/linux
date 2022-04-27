@@ -25,6 +25,7 @@
 #undef sift_rel_mcount
 #undef nop_mcount
 #undef find_secsym_ndx
+#undef find_sym_ndx
 #undef __has_rel_mcount
 #undef has_rel_mcount
 #undef tot_relsize
@@ -60,6 +61,7 @@
 # define sift_rel_mcount	sift64_rel_mcount
 # define nop_mcount		nop_mcount_64
 # define find_secsym_ndx	find64_secsym_ndx
+# define find_sym_ndx		find64_sym_ndx
 # define __has_rel_mcount	__has64_rel_mcount
 # define has_rel_mcount		has64_rel_mcount
 # define tot_relsize		tot64_relsize
@@ -98,6 +100,7 @@
 # define sift_rel_mcount	sift32_rel_mcount
 # define nop_mcount		nop_mcount_32
 # define find_secsym_ndx	find32_secsym_ndx
+# define find_sym_ndx		find32_sym_ndx
 # define __has_rel_mcount	__has32_rel_mcount
 # define has_rel_mcount		has32_rel_mcount
 # define tot_relsize		tot32_relsize
@@ -393,6 +396,51 @@ static void get_sym_str_and_relp(Elf_Shdr const *const relhdr,
 }
 
 /*
+ * Find a symbol in the given section containing the instruction offset passed
+ * in r_offset, to be used in generating the relocation record for the mcount
+ * location. This is used if there were no local/global symbols in the given
+ * section to be used as the base. Weak symbols are ok, and are expected to
+ * result in duplicate mcount locations which get dropped by ftrace.
+ */
+ static int find_sym_ndx(unsigned const txtndx,
+			 char const *const txtname,
+			 uint_t *const recvalp,
+			 unsigned int *sym_index,
+			 Elf_Shdr const *const symhdr,
+			 Elf32_Word const *symtab,
+			 Elf32_Word const *symtab_shndx,
+			 unsigned const r_offset,
+			 Elf_Ehdr const *const ehdr)
+{
+	Elf_Sym const *const sym0 = (Elf_Sym const *)(_w(symhdr->sh_offset)
+		+ (void *)ehdr);
+	unsigned const nsym = _w(symhdr->sh_size) / _w(symhdr->sh_entsize);
+	Elf_Sym const *symp;
+	unsigned t;
+
+	for (symp = sym0, t = nsym; t; --t, ++symp) {
+		if (txtndx == get_symindex(symp, symtab, symtab_shndx)) {
+			/* function symbols on ARM have quirks, avoid them */
+			if (w2(ehdr->e_machine) == EM_ARM &&
+			    ELF_ST_TYPE(symp->st_info) == STT_FUNC)
+				continue;
+
+			if (r_offset >= _w(symp->st_value) &&
+			    r_offset < _w(symp->st_value) + _w(symp->st_size)) {
+				*recvalp = _w(symp->st_value);
+				*sym_index = symp - sym0;
+				return 0;
+			}
+		}
+	}
+
+	fprintf(stderr, "Cannot find symbol containing offset %u for section %u: %s.\n",
+		r_offset, txtndx, txtname);
+
+	return -1;
+}
+
+/*
  * Look at the relocations in order to find the calls to mcount.
  * Accumulate the section offsets that are found, and their relocation info,
  * onto the end of the existing arrays.
@@ -402,9 +450,14 @@ static uint_t *sift_rel_mcount(uint_t *mlocp,
 			       Elf_Rel **const mrelpp,
 			       Elf_Shdr const *const relhdr,
 			       Elf_Ehdr const *const ehdr,
-			       unsigned const recsym,
-			       uint_t const recval,
-			       unsigned const reltype)
+			       unsigned recsym,
+			       uint_t recval,
+			       unsigned const reltype,
+			       unsigned int no_secsym,
+			       char const *const txtname,
+			       Elf_Shdr const *const shdr0,
+			       Elf32_Word const *symtab,
+			       Elf32_Word const *symtab_shndx)
 {
 	uint_t *const mloc0 = mlocp;
 	Elf_Rel *mrelp = *mrelpp;
@@ -415,6 +468,7 @@ static uint_t *sift_rel_mcount(uint_t *mlocp,
 	unsigned const nrel = _w(relhdr->sh_size) / rel_entsize;
 	unsigned mcountsym = 0;
 	unsigned t;
+	uint_t addend;
 
 	get_sym_str_and_relp(relhdr, ehdr, &sym0, &str0, &relp);
 
@@ -424,8 +478,13 @@ static uint_t *sift_rel_mcount(uint_t *mlocp,
 
 		if (mcountsym && mcountsym == Elf_r_sym(relp) &&
 				!is_fake_mcount(relp)) {
-			uint_t const addend =
-				_w(_w(relp->r_offset) - recval + mcount_adjust);
+			if (no_secsym && find_sym_ndx(w(relhdr->sh_info),
+						      txtname, &recval, &recsym,
+						      &shdr0[w(relhdr->sh_link)],
+						      symtab, symtab_shndx,
+						      _w(relp->r_offset), ehdr))
+				return 0;
+			addend = _w(_w(relp->r_offset) - recval + mcount_adjust);
 			mrelp->r_offset = _w(offbase
 				+ ((void *)mlocp - (void *)mloc0));
 			Elf_r_info(mrelp, recsym, reltype);
@@ -544,8 +603,6 @@ static int find_secsym_ndx(unsigned const txtndx,
 			return 0;
 		}
 	}
-	fprintf(stderr, "Cannot find symbol for section %u: %s.\n",
-		txtndx, txtname);
 	return -1;
 }
 
@@ -660,22 +717,25 @@ static int do_func(Elf_Ehdr *const ehdr, char const *const fname,
 			goto out; /* Nothing to be done; don't append! */
 		}
 		if (txtname && is_mcounted_section_name(txtname)) {
-			unsigned int recsym;
+			unsigned int recsym = 0, no_secsym = 0;
 			uint_t recval = 0;
 
 			symsec_sh_link = w(relhdr->sh_link);
-			result = find_secsym_ndx(w(relhdr->sh_info), txtname,
+			if (find_secsym_ndx(w(relhdr->sh_info), txtname,
 						&recval, &recsym,
 						&shdr0[symsec_sh_link],
 						symtab, symtab_shndx,
-						ehdr);
-			if (result)
-				goto out;
+						ehdr))
+				no_secsym = 1;
 
 			rel_entsize = _w(relhdr->sh_entsize);
 			mlocp = sift_rel_mcount(mlocp,
 				(void *)mlocp - (void *)mloc0, &mrelp,
-				relhdr, ehdr, recsym, recval, reltype);
+				relhdr, ehdr, recsym, recval, reltype,
+				no_secsym, txtname, shdr0, symtab,
+				symtab_shndx);
+			if (!mlocp)
+				goto out;
 		} else if (txtname && (warn_on_notrace_sect || make_nop)) {
 			/*
 			 * This section is ignored by ftrace, but still
