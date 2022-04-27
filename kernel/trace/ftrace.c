@@ -6496,7 +6496,7 @@ static int ftrace_process_locs(struct module *mod,
 	struct dyn_ftrace *rec;
 	unsigned long count;
 	unsigned long *p;
-	unsigned long addr;
+	unsigned long addr, prev_addr = 0;
 	unsigned long flags = 0; /* Shut up gcc */
 	int ret = -ENOMEM;
 
@@ -6550,6 +6550,16 @@ static int ftrace_process_locs(struct module *mod,
 	while (p < end) {
 		unsigned long end_offset;
 		addr = ftrace_call_adjust(*p++);
+
+		/*
+		 * Drop duplicate entries, which can happen when weak
+		 * functions are overridden, and __mcount_loc relocation
+		 * records were generated against function names due to
+		 * absence of non-weak section symbols
+		 */
+		if (addr == prev_addr)
+			addr = 0;
+
 		/*
 		 * Some architecture linkers will pad between
 		 * the different mcount_loc sections of different
@@ -6569,6 +6579,7 @@ static int ftrace_process_locs(struct module *mod,
 
 		rec = &pg->records[pg->index++];
 		rec->ip = addr;
+		prev_addr = addr;
 	}
 
 	/* We should have used all pages */
