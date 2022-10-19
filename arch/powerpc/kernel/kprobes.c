@@ -14,8 +14,6 @@
  */
 
 #include <linux/kprobes.h>
-#include <linux/ptrace.h>
-#include <linux/preempt.h>
 #include <linux/extable.h>
 #include <linux/kdebug.h>
 #include <linux/slab.h>

@@ -7,10 +7,6 @@
  *		  IBM Corporation
  */
 #include <linux/kprobes.h>
-#include <linux/ptrace.h>
-#include <linux/hardirq.h>
-#include <linux/preempt.h>
-#include <linux/ftrace.h>
 
 /* Ftrace callback handler for kprobes */
 void kprobe_ftrace_handler(unsigned long nip, unsigned long parent_nip,
