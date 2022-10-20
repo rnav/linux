@@ -49,11 +49,8 @@ optprobe_template_entry:
 	/* Save SPRS */
 	mfmsr	r5
 	PPC_STL	r5,_MSR(r1)
-	li	r5,0x700
-	PPC_STL	r5,_TRAP(r1)
 	li	r5,0
-	PPC_STL	r5,ORIG_GPR3(r1)
-	PPC_STL	r5,RESULT(r1)
+	PPC_STL	r5,_TRAP(r1)
 	mfctr	r5
 	PPC_STL	r5,_CTR(r1)
 	mflr	r5

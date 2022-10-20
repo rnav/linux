@@ -107,6 +107,12 @@
 	PPC_STL	r9, _CTR(r1)
 	PPC_STL	r10, _XER(r1)
 	PPC_STL	r11, _CCR(r1)
+#ifdef CONFIG_PPC64
+	lbz     r7, PACAIRQSOFTMASK(r13)
+	std     r7, SOFTE(r1)
+#endif
+	li	r8, 0
+	PPC_STL	r8, _TRAP(r1)
 	.endif
 
 	/* Load &pt_regs in r6 for call below */
