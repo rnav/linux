@@ -100,12 +100,6 @@
 	mr	r14, r7		/* remember old NIP */
 #endif
 
-	/* Calculate ip from nip-4 into r3 for call below */
-	subi    r3, r7, MCOUNT_INSN_SIZE
-
-	/* Put the original return address in r4 as parent_ip */
-	mr	r4, r0
-
 	/* Save special regs */
 	PPC_STL	r8, _MSR(r1)
 	.if \allregs == 1
@@ -114,6 +108,26 @@
 	PPC_STL	r11, _CCR(r1)
 	.endif
 
+#ifdef CONFIG_FTRACE_PFE_OUT_OF_LINE
+	/*
+	 * We want the ftrace location in the function, but our lr (in r7)
+	 * points at the 'mtlr r0' instruction in the out of line stub.  To
+	 * recover the ftrace location, we read the branch instruction in the
+	 * stub, and adjust our lr by the branch offset.
+	 */
+	lwz	r8, MCOUNT_INSN_SIZE(r7)
+	li	r9, 6
+	slw	r8, r8, r9
+	sraw	r8, r8, r9
+	add	r3, r7, r8
+#else
+	/* Calculate ip from nip-4 into r3 for call below */
+	subi    r3, r7, MCOUNT_INSN_SIZE
+#endif
+
+	/* Put the original return address in r4 as parent_ip */
+	mr	r4, r0
+
 	/* Load &pt_regs in r6 for call below */
 	addi    r6, r1, STACK_INT_FRAME_REGS
 .endm
@@ -121,10 +135,15 @@
 .macro	ftrace_regs_exit allregs
 	/* Load ctr with the possibly modified NIP */
 	PPC_LL	r3, _NIP(r1)
-	mtctr	r3
 
 #ifdef CONFIG_LIVEPATCH_64
 	cmpd	r14, r3		/* has NIP been altered? */
+#endif
+
+#ifdef CONFIG_FTRACE_PFE_OUT_OF_LINE
+	mtlr	r3
+#else
+	mtctr	r3
 #endif
 
 	/* Restore gprs */
@@ -139,7 +158,9 @@
 
 	/* Restore possibly modified LR */
 	PPC_LL	r0, _LINK(r1)
+#ifndef CONFIG_FTRACE_PFE_OUT_OF_LINE
 	mtlr	r0
+#endif
 
 #ifdef CONFIG_PPC64
 	/* Restore callee's TOC */
@@ -153,7 +174,12 @@
         /* Based on the cmpd above, if the NIP was altered handle livepatch */
 	bne-	livepatch_handler
 #endif
-	bctr			/* jump after _mcount site */
+	/* jump after _mcount site */
+#ifdef CONFIG_FTRACE_PFE_OUT_OF_LINE
+	blr
+#else
+	bctr
+#endif
 .endm
 
 _GLOBAL(ftrace_regs_caller)
@@ -177,12 +203,18 @@ _GLOBAL(ftrace_stub)
 
 #ifdef CONFIG_PPC64
 ftrace_no_trace:
+#ifdef CONFIG_FTRACE_PFE_OUT_OF_LINE
+	REST_GPR(3, r1)
+	addi	r1, r1, SWITCH_FRAME_SIZE+STACK_FRAME_MIN_SIZE
+	blr
+#else
 	mflr	r3
 	mtctr	r3
 	REST_GPR(3, r1)
 	addi	r1, r1, SWITCH_FRAME_SIZE+STACK_FRAME_MIN_SIZE
 	mtlr	r0
 	bctr
+#endif
 #endif
 
 #ifdef CONFIG_LIVEPATCH_64
@@ -196,9 +228,9 @@ ftrace_no_trace:
 	 *
 	 * On entry:
 	 *  - we have no stack frame and can not allocate one
-	 *  - LR points back to the original caller (in A)
-	 *  - CTR holds the new NIP in C
-	 *  - r0, r11 & r12 are free
+	 *  - LR/r0 points back to the original caller (in A)
+	 *  - CTR/LR holds the new NIP in C
+	 *  - r11 & r12 are free
 	 */
 livepatch_handler:
 	ld	r12, PACA_THREAD_INFO(r13)
@@ -208,18 +240,23 @@ livepatch_handler:
 	addi	r11, r11, 24
 	std	r11, TI_livepatch_sp(r12)
 
-	/* Save toc & real LR on livepatch stack */
-	std	r2,  -24(r11)
-	mflr	r12
-	std	r12, -16(r11)
-
 	/* Store stack end marker */
 	lis     r12, STACK_END_MAGIC@h
 	ori     r12, r12, STACK_END_MAGIC@l
 	std	r12, -8(r11)
 
-	/* Put ctr in r12 for global entry and branch there */
+	/* Save toc & real LR on livepatch stack */
+	std	r2,  -24(r11)
+#ifndef CONFIG_FTRACE_PFE_OUT_OF_LINE
+	mflr	r12
+	std	r12, -16(r11)
 	mfctr	r12
+#else
+	std	r0, -16(r11)
+	mflr	r12
+	/* Put ctr in r12 for global entry and branch there */
+	mtctr	r12
+#endif
 	bctrl
 
 	/*
