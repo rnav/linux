@@ -106,20 +106,36 @@ static unsigned long find_ftrace_tramp(unsigned long ip)
 	return 0;
 }
 
+static struct module *ftrace_lookup_module(struct dyn_ftrace *rec)
+{
+	struct module *mod = NULL;
+
+#ifdef CONFIG_MODULES
+	/*
+	 * NOTE: __module_text_address() must be called with preemption
+	 * disabled, but we can rely on ftrace_lock to ensure that 'mod'
+	 * retains its validity throughout the remainder of this code.
+	*/
+	preempt_disable();
+	mod = __module_text_address(rec->ip);
+	preempt_enable();
+
+	if (!mod)
+		pr_err("No module loaded at addr=%lx\n", rec->ip);
+#endif
+
+	return mod;
+}
+
 static int ftrace_get_call_inst(struct dyn_ftrace *rec, unsigned long addr, ppc_inst_t *call_inst)
 {
 	unsigned long ip = rec->ip;
 	unsigned long stub;
+	struct module *mod;
 
 	if (is_offset_in_branch_range(addr - ip)) {
 		/* Within range */
 		stub = addr;
-#ifdef CONFIG_MODULES
-	} else if (rec->arch.mod) {
-		/* Module code would be going to one of the module stubs */
-		stub = (addr == (unsigned long)ftrace_caller ? rec->arch.mod->arch.tramp :
-							       rec->arch.mod->arch.tramp_regs);
-#endif
 	} else if (core_kernel_text(ip)) {
 		/* We would be branching to one of our ftrace stubs */
 		stub = find_ftrace_tramp(ip);
@@ -128,7 +144,16 @@ static int ftrace_get_call_inst(struct dyn_ftrace *rec, unsigned long addr, ppc_
 			return -EINVAL;
 		}
 	} else {
-		return -EINVAL;
+		mod = ftrace_lookup_module(rec);
+		if (mod) {
+#ifdef CONFIG_MODULES
+			/* Module code would be going to one of the module stubs */
+			stub = (addr == (unsigned long)ftrace_caller ? mod->arch.tramp :
+								       mod->arch.tramp_regs);
+#endif
+		} else {
+			return -EINVAL;
+		}
 	}
 
 	*call_inst = ftrace_create_branch_inst(ip, stub, 1);
@@ -255,14 +280,6 @@ int ftrace_init_nop(struct module *mod, struct dyn_ftrace *rec)
 
 	if (ret)
 		return ret;
-
-	if (!core_kernel_text(ip)) {
-		if (!mod) {
-			pr_err("0x%lx: No module provided for non-kernel address\n", ip);
-			return -EFAULT;
-		}
-		rec->arch.mod = mod;
-	}
 
 	/* Nop-out the ftrace location */
 	new = ppc_inst(PPC_RAW_NOP());
